@@ -1,9 +1,33 @@
 # Kh-debug-mcp
 
+> [!WARNING]
+> **WORK IN PROGRESS (WIP) — EXPERIMENTAL PROTOTYPE**
+>
+> This repository is for **development and controlled testing only**. It is **not
+> production-ready**, security-audited, or suitable for exposure to the public
+> internet. The current image check compares **SHA-256 hashes of identical PNG
+> files**; it is **not** the real one-A/many-B StegoSplit authentication scheme.
+> A copied test B can be reused to authenticate.
+>
+> **Do not rely on this project to protect real systems or credentials.**
+
 Rust MCP + independent Rust AuthGate + disposable Rust diagnostic agent.
-This repository is experimental: the current **tunnel test uses SHA-256 equality
-of A and B** instead of real StegoSplit. The original Python StegoSplit v0.6
-reference integration remains in `dev/` for future authentication.
+
+### Current status
+
+- **Working prototype:** Separate MCP, AuthGate, and optional user-agent
+  containers; authenticated command relay through AuthGate; actual `/bin/sh`
+  execution inside the test agent; blocked access if AuthGate is unavailable.
+- **Temporary implementation:** Identical A/B PNG SHA-256 comparison, with
+  short-lived in-memory sessions and HTTP request/response polling.
+- **Still to implement:** Proper one-A/many-B StegoSplit verification in Rust,
+  credential issuance and per-B revocation, secure remote transport, robust
+  session and process cancellation, and a usable configuration/UI flow.
+- **Reference implementation:** Original Python StegoSplit v0.6 routines are
+  preserved under `dev/` for development and comparison; the final Docker
+  images do not include those Python modules.
+
+Passing CI demonstrates the **test scenario**, not production-grade security.
 
 ## Roles
 
@@ -23,7 +47,7 @@ reference integration remains in `dev/` for future authentication.
    AuthGate stops/denies the session. There is no agent-side listening port,
    OpenSSH server, or permanent background installation.
 
-The two production Docker services stay running together across separate
+The two default Docker services run together across separate
 networks: MCP is on `mcp_auth`, the optional test user is on `auth_agent`, and
 AuthGate joins both. The user agent **cannot resolve or reach MCP directly** and
 contacts AuthGate only. They use authenticated HTTP calls, **not yet
