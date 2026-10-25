@@ -1,0 +1,28 @@
+name: kh-debug-mcp
+services:
+  mcp:
+    build: .
+    image: kh-debug-mcp:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:41370:41370"
+    environment:
+      KH_DEBUG_BIND: "0.0.0.0:41370"
+      KH_DEBUG_IMAGE_DIR: "/data/images"
+      KH_DEBUG_ALLOWED_HOSTS: "localhost:41370,127.0.0.1:41370"
+    volumes:
+      - images:/data/images
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m
+    healthcheck:
+      test: ["CMD", "pwsh", "-NoProfile", "-Command", "if ((Invoke-WebRequest http://127.0.0.1:41370/health).StatusCode -eq 200) { exit 0 } else { exit 1 }"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+volumes:
+  images:
+    name: kh-debug-mcp-images

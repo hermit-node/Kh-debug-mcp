@@ -1,0 +1,78 @@
+name: Docker build and MCP smoke test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  docker-smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Docker Compose
+        run: docker compose config --quiet
+      - name: Build Linux image
+        run: docker build --pull -t kh-debug-mcp:test .
+      - name: Start isolated MCP server
+        run: |
+          docker volume create kh-debug-mcp-smoke-images
+          docker run -d --name kh-debug-mcp-smoke \
+            -p 127.0.0.1:41370:41370 \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,nosuid,nodev,size=16m \
+            -e KH_DEBUG_BIND=0.0.0.0:41370 \
+            -e KH_DEBUG_IMAGE_DIR=/data/images \
+            -v kh-debug-mcp-smoke-images:/data/images \
+            kh-debug-mcp:test
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:41370/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs kh-debug-mcp-smoke
+          exit 1
+      - name: Verify MCP initializes and executes PowerShell inside Docker
+        run: |
+          curl -fsS http://127.0.0.1:41370/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' \
+            | grep 'kh-debug-mcp'
+          curl -fsS http://127.0.0.1:41370/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_powershell","arguments":{"command":"Write-Output MCP_DOCKER_TEST"}}}' \
+            | grep 'MCP_DOCKER_TEST'
+      - name: Verify PNG storage persists across container recreation
+        run: |
+          image='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2sX9sAAAAASUVORK5CYII='
+          printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"save_image","arguments":{"name":"persisted","png_base64":"%s"}}}' "$image" \
+            | curl -fsS http://127.0.0.1:41370/mcp \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/json, text/event-stream' \
+                --data-binary @- | grep '"isError":false'
+          docker rm -f kh-debug-mcp-smoke
+          docker run -d --name kh-debug-mcp-smoke \
+            -p 127.0.0.1:41370:41370 \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,nosuid,nodev,size=16m \
+            -e KH_DEBUG_BIND=0.0.0.0:41370 \
+            -e KH_DEBUG_IMAGE_DIR=/data/images \
+            -v kh-debug-mcp-smoke-images:/data/images \
+            kh-debug-mcp:test
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:41370/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:41370/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_images","arguments":{}}}' \
+            | grep 'persisted.png'
+      - name: Clean up test container and volume
+        if: always()
+        run: |
+          docker rm -f kh-debug-mcp-smoke || true
+          docker volume rm kh-debug-mcp-smoke-images || true

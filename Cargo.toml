@@ -1,14 +1,15 @@
 [package]
 name = "kh-debug-mcp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
-description = "Minimal Rust Streamable HTTP MCP server for local Windows PowerShell"
+description = "Portable Rust Streamable HTTP MCP server with PowerShell and a five-PNG volume"
 
 [dependencies]
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
+base64 = "0.22"
 
 [dev-dependencies]
 tower = "0.5"

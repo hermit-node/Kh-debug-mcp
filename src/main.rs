@@ -1,19 +1,26 @@
-//! KH Debug MCP: a small, stateless MCP server running locally on Windows.
-//! Accept connections on loopback only. Use a trusted Secure MCP Tunnel
+//! KH Debug MCP: a small MCP server for Windows or Linux Docker.
+//! Expose on host loopback only. Use a trusted Secure MCP Tunnel
 //! rather than publishing this arbitrary-command tool on the Internet.
 use axum::{
     Json, Router,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use std::{net::SocketAddr, time::Duration};
-#[cfg(windows)]
+use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::process::Command;
+mod image_store;
+use image_store::ImageStore;
+mod image_tools;
 use tokio::time::timeout;
 
-const ADDRESS: &str = "127.0.0.1:41370";
+const DEFAULT_ADDRESS: &str = "127.0.0.1:41370";
+struct AppState {
+    images: ImageStore,
+    allowed_hosts: Vec<String>,
+}
 const MAX_COMMAND_LENGTH: usize = 8192;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -30,8 +37,8 @@ fn tool_result(text: String, is_error: bool) -> Value {
 fn tool_definition() -> Value {
     json!({
         "name": "run_powershell",
-        "title": "Run PowerShell on this Windows computer",
-        "description": "Run a PowerShell command locally as the Windows account hosting this MCP server. This can change system state. Request user approval before commands that modify files, services, configuration or software.",
+        "title": "Run PowerShell in the MCP runtime",
+        "description": "Run PowerShell inside this MCP process environment (inside the container when using Docker, not on the Docker host). This can change system state. Obtain user approval for modifications.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -62,17 +69,13 @@ async fn run_powershell(args: &Value) -> Value {
     if !(1..=120).contains(&seconds) {
         return tool_result("timeout_seconds must be 1–120".into(), true);
     }
-    #[cfg(not(windows))]
     {
-        let _ = (script, seconds);
-        return tool_result(
-            "PowerShell execution is supported only on Windows hosts".into(),
-            true,
-        );
-    }
-    #[cfg(windows)]
-    {
-        let mut process = Command::new("powershell.exe");
+        let shell = if cfg!(windows) {
+            "powershell.exe"
+        } else {
+            "pwsh"
+        };
+        let mut process = Command::new(shell);
         process.args([
             "-NoLogo",
             "-NoProfile",
@@ -120,7 +123,11 @@ async fn run_powershell(args: &Value) -> Value {
 }
 
 /// No browser access, even from a malicious tab on the same computer.
-async fn mcp(headers: HeaderMap, Json(request): Json<Value>) -> Response {
+async fn mcp(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Response {
     if headers.contains_key("origin") {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -128,7 +135,7 @@ async fn mcp(headers: HeaderMap, Json(request): Json<Value>) -> Response {
         .get("host")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    if !matches!(host, "127.0.0.1:41370" | "localhost:41370") {
+    if !state.allowed_hosts.iter().any(|h| h == host) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(method) = request.get("method").and_then(Value::as_str) else {
@@ -152,18 +159,52 @@ async fn mcp(headers: HeaderMap, Json(request): Json<Value>) -> Response {
             }),
         ),
         "ping" => rpc_ok(id, json!({})),
-        "tools/list" => rpc_ok(id, json!({"tools":[tool_definition()]})),
+        "tools/list" => rpc_ok(
+            id,
+            json!({"tools":[tool_definition(),image_tools::list_tool(),image_tools::save_tool(),image_tools::delete_tool()]}),
+        ),
         "tools/call" => {
             let Some(params) = request.get("params") else {
                 return rpc_error(id, -32602, "Missing params");
             };
-            if params.get("name").and_then(Value::as_str) != Some("run_powershell") {
-                return rpc_error(id, -32602, "Unknown tool");
-            }
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            rpc_ok(id, run_powershell(&args).await)
+            rpc_ok(
+                id,
+                call_tool(
+                    &state,
+                    params.get("name").and_then(Value::as_str).unwrap_or(""),
+                    &args,
+                )
+                .await,
+            )
         }
         _ => rpc_error(id, -32601, "Method not found"),
+    }
+}
+
+async fn call_tool(state: &AppState, name: &str, args: &Value) -> Value {
+    match name {
+        "run_powershell" => run_powershell(args).await,
+        "list_images" => match state.images.list().await {
+            Ok(items) => tool_result(json!({"images":items,"max_images":96}).to_string(), false),
+            Err(e) => tool_result(e.to_string(), true),
+        },
+        "save_image" => {
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+            let png = args.get("png_base64").and_then(Value::as_str).unwrap_or("");
+            match state.images.save(name, png).await {
+                Ok(record) => tool_result(record.to_string(), false),
+                Err(e) => tool_result(e, true),
+            }
+        }
+        "delete_image" => {
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+            match state.images.delete(name).await {
+                Ok(()) => tool_result("Image deleted".into(), false),
+                Err(e) => tool_result(e, true),
+            }
+        }
+        _ => tool_result("Unknown tool".into(), true),
     }
 }
 
@@ -173,12 +214,28 @@ async fn health() -> Json<Value> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = ADDRESS.parse()?;
+    let bind = env::var("KH_DEBUG_BIND").unwrap_or_else(|_| DEFAULT_ADDRESS.into());
+    let addr: SocketAddr = bind.parse()?;
+    let allowed = env::var("KH_DEBUG_ALLOWED_HOSTS")
+        .unwrap_or_else(|_| "localhost:41370,127.0.0.1:41370".into());
+    let allowed_hosts = allowed.split(',').map(|s| s.trim().to_string()).collect();
+    let images = ImageStore::new(
+        env::var("KH_DEBUG_IMAGE_DIR")
+            .unwrap_or_else(|_| "./images".into())
+            .into(),
+    )
+    .await?;
+    let state = Arc::new(AppState {
+        images,
+        allowed_hosts,
+    });
     let app = Router::new()
         .route("/health", get(health))
-        .route("/mcp", post(mcp));
+        .route("/mcp", post(mcp))
+        .layer(DefaultBodyLimit::max(6 * 1024 * 1024))
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("KH Debug MCP listening at http://{ADDRESS}/mcp (loopback only)");
+    println!("KH Debug MCP listening at http://{bind}/mcp");
     println!("For ChatGPT, connect using a trusted Secure MCP Tunnel.");
     axum::serve(listener, app).await?;
     Ok(())

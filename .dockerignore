@@ -1,0 +1,9 @@
+target
+.git
+dist
+.env
+*.png
+*.key
+*.pem
+*.sqlite3
+*.db
