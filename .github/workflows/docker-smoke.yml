@@ -11,13 +11,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Validate Compose configuration
         run: docker compose config --quiet
       - name: Build and start MCP plus AuthGate
         run: |
           docker compose up -d --build
-          for i in $(seq 1 100); do
+          echo "Diagnose mounted volume access from each container user (no secrets printed)"
+          docker compose run --rm --no-deps --entrypoint /bin/sh mcp -c 'id; ls -ldn /data/screenshots /service /service/token /opt/kh-debug/master.png; test -r /service/token; echo service_token_readable=$?; test -w /data/screenshots; echo screenshot_writable=$?'
+          docker compose run --rm --no-deps --entrypoint /bin/sh auth -c 'id; ls -ldn /auth/state /service /service/token; test -r /service/token; echo service_token_readable=$?'
+          for i in $(seq 1 20); do
             if curl -fsS http://127.0.0.1:41370/health >/dev/null &&
                curl -fsS http://127.0.0.1:41371/health >/dev/null; then break; fi
             sleep 2
