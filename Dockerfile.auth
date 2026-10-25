@@ -9,9 +9,9 @@ RUN cargo build --locked --release --bin kh-debug-auth --bin kh-debug-pairgen -j
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10002 --create-home khauth \
-    && mkdir -p /auth/state /auth/pair /provision/auth /provision/mcp /provision/state \
-    && chown -R 10002:10002 /auth /provision
+    && groupadd --gid 10003 khshared && useradd --system --uid 10002 --groups khshared --create-home khauth \
+    && mkdir -p /auth/state /auth/pair /provision/auth /provision/mcp /provision/state /service \
+    && chown -R 10002:10002 /auth /provision && chown 10002:10003 /service && chmod 2770 /service
 COPY --from=build /build/target/release/kh-debug-auth /usr/local/bin/kh-debug-auth
 COPY --from=build /build/target/release/kh-debug-pairgen /usr/local/bin/kh-debug-pairgen
 USER 10002:10002

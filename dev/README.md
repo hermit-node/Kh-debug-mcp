@@ -1,5 +1,9 @@
 # Windows StegoSplit v0.6 reference bridge
 
+Note: The separate AuthGate SHA-256 tunnel test in v0.5.0 deliberately does not
+call this verifier. These Python scripts remain available for the later real
+StegoSplit integration.
+
 Development-only compatibility harness. The final application remains Rust-only;
 Python and private .pyd modules are not packaged in either Linux Docker image.
 

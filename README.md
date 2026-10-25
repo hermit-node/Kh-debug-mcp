@@ -1,8 +1,32 @@
 # Kh-debug-mcp
 
-A small Rust Streamable HTTP MCP server for ChatGPT, with a PowerShell tool and persistent storage for **up to 96 PNG images**.
+Rust MCP + independent Rust AuthGate + disposable Rust diagnostic agent.
+This repository is experimental: the current **tunnel test uses SHA-256 equality
+of A and B** instead of real StegoSplit. The original Python StegoSplit v0.6
+reference integration remains in `dev/` for future authentication.
 
-## Docker (Linux containers)
+## Roles
+
+1. **MCP (Docker)** holds **A**. ChatGPT connects to its Streamable HTTP MCP
+   endpoint and requests `run_remote_powershell`. MCP communicates with AuthGate
+   over a private authenticated service endpoint; it never connects directly to
+   the diagnostic machine. An internal, token-protected endpoint returns only
+   A's SHA-256 hash to AuthGate.
+2. **AuthGate (separate Docker image)** is the sole relay between MCP and users.
+   The diagnostic agent submits B directly to AuthGate. AuthGate fetches A's
+   checksum from MCP, compares the two, then issues an expiring in-memory agent
+   session. Before sending a job, accepting a result, or allowing another poll,
+   it checks again. When AuthGate is down, remote execution is blocked.
+3. **Diagnostic EXE (Windows)** holds **B**, opens outbound HTTP(S) to AuthGate,
+   executes only jobs received via that approved channel, and closes when
+   AuthGate stops/denies the session. There is no agent-side listening port,
+   OpenSSH server, or permanent background installation.
+
+The two Docker services stay running together on a private Docker network. The
+user agent contacts AuthGate only. They use authenticated HTTP calls, **not yet
+a continuously open TCP/WebSocket tunnel**.
+
+## Docker
 
 ```bash
 git clone https://github.com/hermit-node/Kh-debug-mcp.git
@@ -10,73 +34,58 @@ cd Kh-debug-mcp
 docker compose up -d --build
 ```
 
-- Docker host endpoint: `http://127.0.0.1:41370/mcp`
-- Health check: `http://127.0.0.1:41370/health`
-- Persistent Docker volume: `kh-debug-mcp-screenshots`, mounted at `/data/screenshots`.
-- Each PNG is limited to 10 MiB. Images are not recompressed or modified.
-- The **96-image maximum** is enforced by the Rust image-store implementation.
-- Tools: `run_powershell`, `list_images`, `save_image` (base64 PNG), `delete_image`.
-- Docker starts automatically after reboots, unless you explicitly stop the service.
-- No Windows OpenSSH service, Docker socket mount, or host administrator access is required.
+The default test master A is `assets/kernelhermit-default.png`, copied
+unchanged into the MCP image. The matching **test** B must be an exact copy of
+this same PNG; different files are rejected. This temporary SHA-256 match is
+not equivalent to real one-A/many-B StegoSplit. The original StegoSplit codec
+and issuance routines have not been changed.
 
-**Important:** PowerShell in Docker executes **inside the Linux container**, not on the physical Docker host. It uses PowerShell 7 (`pwsh`), which does not supply Windows-only cmdlets. To diagnose the Windows host itself, use the native Windows EXE below instead. The Docker image requires a supported Linux/CPU architecture and has not been validated on every Docker platform.
+- MCP: `http://127.0.0.1:41370/mcp` (host loopback only)
+- AuthGate: `http://127.0.0.1:41371` (host loopback only by default)
+- `Dockerfile`: MCP image with PowerShell 7 inside Linux container
+- `Dockerfile.auth`: independent AuthGate image
+- Persistent `kh-debug-mcp-screenshots`: **96 PNG files maximum**, **10 MiB
+  each**, mounted as `/data/screenshots`
+- Persistent `kh-debug-auth-state`: future registry and private admin token
+- Persistent `kh-debug-service-auth`: automatically generated shared internal
+  service token; no user-entered master passphrase
+- Containers run without host Docker socket or privileged mode
 
-## Separate Auth Server Dockerfile
+Do not expose these development HTTP endpoints to the public internet.
+For a real KH24 → KHzz/CA8D deployment, give the agent an HTTPS endpoint on
+a trusted private network or a TLS-protected reverse proxy. The out-of-box
+loopback binding intentionally does **not** accept remote devices.
 
-Compose automatically launches a short-lived pairing generator, the independent
-**Rust Auth Server** (built using `Dockerfile.auth`) and the MCP. It creates a
-lossless **A/B PNG pair with a random 64-bit key** on first run;
-A remains with Auth and B remains with MCP. Both are required for the MCP to
-start and accept command tools. To build Auth separately:
-
-```bash
-docker build -f Dockerfile.auth -t kh-debug-auth:local .
-```
-
-The PNG pairing is a new experimental Rust implementation and **not compatible
-with the Windows-only StegoSplit v0.6 binary codec**. Existing StegoSplit
-verification remains a separate optional integration. The 64-bit key is
-weaker than modern authentication keys and this is not a production-grade
-access-control system.
-
-See [AUTH_SERVER.md](AUTH_SERVER.md) for provisioning, separated persistent
-pairing volumes, verification flow, and security limitations. No master
-passphrase is required.
-
-## Native Windows executable
+## Native Windows agent
 
 ```powershell
-cargo test
-cargo build --release
-.\target\release\kh-debug-mcp.exe
+cargo build --release --bin kh-debug-agent
+$env:KH_AGENT_AUTH_URL = 'http://127.0.0.1:41371'
+$env:KH_AGENT_USER = 'testagent'
+$env:KH_AGENT_B = 'C:\path\to\B.png'
+.\target\release\kh-debug-agent.exe
 ```
 
-Native Windows PowerShell runs in the context of the Windows user who starts the EXE. On native Windows the server defaults to `127.0.0.1:41370`; images default to a local `./screenshots` directory.
+For the full remote deployment, configure `KH_AGENT_AUTH_URL` to use trusted
+HTTPS. Do not send B over unsecured cross-machine HTTP.
 
-## ChatGPT integration
+## Tests
 
-The server supports MCP Streamable HTTP (`initialize`, `ping`, `tools/list`, `tools/call`). Connect ChatGPT through a **Secure MCP Tunnel** to the local `http://127.0.0.1:41370/mcp` endpoint. Never expose this command-execution service directly to the public Internet.
+`dev/sha_relay_smoke.ps1` tests three separate Rust processes on **one Windows
+machine**, including no-AuthGate blocking, no direct MCP agent endpoint,
+mismatched B rejection, authorized command routing, AuthGate shutdown and
+agent disconnection. `.github/workflows/docker-smoke.yml` tests the two Docker
+containers on GitHub's runner with a simulated agent job.
 
-When a trusted proxy forwards a different `Host` header, configure `KH_DEBUG_ALLOWED_HOSTS` as a comma-separated allowlist of the exact host-and-port values. Configure `KH_DEBUG_BIND` only when different in-container binding is necessary. Compose intentionally publishes to **host loopback only**.
+The original StegoSplit Python compatibility bridge and its working
+one-A/many-B tests remain in `dev/stegosplit_reference_bridge.py`. That
+Python reference will be used to replace the temporary SHA-256 gate later.
 
-## Windows reference StegoSplit bridge (development only)
-
-Rust Auth Server can use the **original Windows Python 3.14 compiled StegoSplit**
-implementation through the local process adapter in `dev/stegosplit_reference_bridge.py`.
-Rust sends server-held A and presented B to Python over standard input; Python
-checks its registered credential database, passwords, expiry and revocation.
-The Rust MCP rechecks the result before PowerShell tool execution. Multiple B
-credentials can share one unchanged A. See [dev/README.md](dev/README.md).
-
-This is a development compatibility harness on Windows. **The Linux Docker images
-still use the earlier experimental 1-to-1 image gate. They do not package Python,
-`.pyd` modules or the new registered-user backend.** Do not describe the Docker
-stack as supporting original StegoSplit users until the Rust port is complete.
-
-## Security and storage
-
-This is a basic MCP experiment, **not a hardened public service**. It has no application-level authentication. Allow access only from a trusted local interface and trusted tunnel; other containers sharing the same Docker network may also be able to reach it. It executes PowerShell with the permissions of its process. Do not use `privileged` mode or mount the host's Docker socket.
-
-The image volume persists when the container is recreated. `docker compose down` preserves it; `docker compose down -v` destroys it. PNGs are stored as raw files, not encrypted at rest, so do not place sensitive StegoSplit credentials there until you have a suitable protection and authorization design.
-
-No Norm or existing CA8D stack files are modified by this repo. No automatic system SSH setup, authentication pairing, or secondary-computer tunnel is included.
+**Security limitations:** SHA-256 equality of identical images is only a
+functional test and is not strong authentication; a copied B can be replayed.
+This prototype has no per-device attestation or replay-resistant challenge
+and has not been security audited. Revoking a session or stopping AuthGate
+blocks new jobs and results, but cannot necessarily stop a PowerShell command
+that the user machine already started. The demo should not be exposed to
+untrusted networks. The local `run_powershell` MCP tool executes only *inside
+the MCP container*, separate from the AuthGate-controlled remote tool.

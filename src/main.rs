@@ -10,7 +10,9 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use subtle::ConstantTimeEq;
 use tokio::process::Command;
 mod image_store;
 use image_store::ImageStore;
@@ -22,6 +24,51 @@ struct AppState {
     images: ImageStore,
     allowed_hosts: Vec<String>,
     pair_gate: Option<PairGate>,
+    relay: Option<McpRelay>,
+}
+struct McpRelay {
+    secret: String,
+    master: std::path::PathBuf,
+    auth_url: String,
+    client: reqwest::Client,
+}
+impl McpRelay {
+    fn allowed(&self, headers: &HeaderMap) -> bool {
+        let Some(token) = headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+        else {
+            return false;
+        };
+        token.len() == self.secret.len()
+            && bool::from(token.as_bytes().ct_eq(self.secret.as_bytes()))
+    }
+    async fn command(&self, script: &str, seconds: u64, target: Option<&str>) -> Value {
+        let reply = self
+            .client
+            .post(&self.auth_url)
+            .bearer_auth(&self.secret)
+            .json(&json!({"command":script,"timeout_seconds":seconds,"target_user":target}))
+            .send()
+            .await;
+        let Ok(reply) = reply else {
+            return tool_result("AuthGate unavailable: remote command blocked".into(), true);
+        };
+        if !reply.status().is_success() {
+            return tool_result(
+                format!("AuthGate blocked remote command ({})", reply.status()),
+                true,
+            );
+        }
+        match reply.json::<Value>().await {
+            Ok(body) if body.get("result").is_some() => body["result"].clone(),
+            _ => tool_result(
+                "Invalid AuthGate response; remote command blocked".into(),
+                true,
+            ),
+        }
+    }
 }
 struct PairGate {
     url: String,
@@ -63,6 +110,15 @@ fn tool_result(text: String, is_error: bool) -> Value {
     json!({"content":[{"type":"text","text":text}],"isError":is_error})
 }
 
+fn remote_tool() -> Value {
+    json!({"name":"run_remote_powershell",
+        "description":"Send PowerShell to a user diagnostic EXE through AuthGate only. AuthGate must remain online and authorize the session.",
+        "inputSchema":{"type":"object","properties":{
+            "command":{"type":"string"},"target_user":{"type":"string"},
+            "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
+        },"required":["command"],"additionalProperties":false},
+        "annotations":{"readOnlyHint":false,"destructiveHint":true}})
+}
 fn tool_definition() -> Value {
     json!({
         "name": "run_powershell",
@@ -188,10 +244,18 @@ async fn mcp(
             }),
         ),
         "ping" => rpc_ok(id, json!({})),
-        "tools/list" => rpc_ok(
-            id,
-            json!({"tools":[tool_definition(),image_tools::list_tool(),image_tools::save_tool(),image_tools::delete_tool()]}),
-        ),
+        "tools/list" => {
+            let mut tools = vec![
+                tool_definition(),
+                image_tools::list_tool(),
+                image_tools::save_tool(),
+                image_tools::delete_tool(),
+            ];
+            if state.relay.is_some() {
+                tools.push(remote_tool());
+            }
+            rpc_ok(id, json!({"tools":tools}))
+        }
         "tools/call" => {
             if let Some(gate) = &state.pair_gate {
                 if !gate.authorized().await {
@@ -219,6 +283,22 @@ async fn mcp(
 async fn call_tool(state: &AppState, name: &str, args: &Value) -> Value {
     match name {
         "run_powershell" => run_powershell(args).await,
+        "run_remote_powershell" => {
+            let Some(relay) = &state.relay else {
+                return tool_result("AuthGate not configured".into(), true);
+            };
+            let command = args["command"].as_str().unwrap_or("");
+            let seconds = args["timeout_seconds"].as_u64().unwrap_or(30);
+            if command.is_empty()
+                || command.len() > MAX_COMMAND_LENGTH
+                || !(1..=120).contains(&seconds)
+            {
+                return tool_result("Invalid remote command".into(), true);
+            }
+            relay
+                .command(command, seconds, args["target_user"].as_str())
+                .await
+        }
         "list_images" => match state.images.list().await {
             Ok(items) => tool_result(json!({"images":items,"max_images":96}).to_string(), false),
             Err(e) => tool_result(e.to_string(), true),
@@ -240,6 +320,28 @@ async fn call_tool(state: &AppState, name: &str, args: &Value) -> Value {
         }
         _ => tool_result("Unknown tool".into(), true),
     }
+}
+
+async fn master_digest(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    let Some(relay) = &state.relay else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+    };
+    if !relay.allowed(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({})));
+    }
+    let Ok(bytes) = tokio::fs::read(&relay.master).await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+    };
+    if bytes.len() > 10 * 1024 * 1024 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"sha256":format!("{:x}",Sha256::digest(bytes))})),
+    )
 }
 
 async fn health() -> Json<Value> {
@@ -301,14 +403,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("A/B image pairing failed: MCP will not listen".into());
         }
     }
+    let relay=match (env::var("KH_DEBUG_MASTER_A").ok(),env::var("KH_DEBUG_AUTH_RELAY_URL").ok(),
+        env::var("KH_DEBUG_SERVICE_TOKEN_FILE").ok()){
+        (None,None,None)=>None,
+        (Some(master),Some(url),Some(secret_file))=>{
+            if !url.starts_with("http://127.0.0.1:") && !url.starts_with("http://auth:41371/") {
+                return Err("AuthGate relay URL must be private".into());
+            }
+            let master=std::path::PathBuf::from(master);
+            if !master.is_absolute()||!master.is_file(){return Err("Master A file unavailable".into())}
+            let secret=tokio::fs::read_to_string(secret_file).await?.trim().to_owned();
+            if secret.len()<32{return Err("MCP/Auth service token unavailable".into())}
+            let client=reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+            Some(McpRelay{secret,master,auth_url:url,client})
+        }
+        _=>return Err("Set KH_DEBUG_MASTER_A, KH_DEBUG_AUTH_RELAY_URL and KH_DEBUG_SERVICE_TOKEN_FILE together".into())
+    };
     let state = Arc::new(AppState {
         images,
         allowed_hosts,
         pair_gate,
+        relay,
     });
     let app = Router::new()
         .route("/health", get(health))
         .route("/mcp", post(mcp))
+        .route("/internal/master-sha256", get(master_digest))
         .layer(DefaultBodyLimit::max(14 * 1024 * 1024))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;

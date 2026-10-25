@@ -1,41 +1,34 @@
 name: kh-debug-mcp
+# Two long-running, separate Docker services and one outbound user-side EXE.
+# The AuthGate is the ONLY path between MCP and the user diagnostic agent.
+# In this SHA-only test, both pictures must contain identical lossless PNG bytes.
 services:
-  pairgen:
+  auth:
     build:
       context: .
       dockerfile: Dockerfile.auth
     image: kh-debug-auth:local
-    entrypoint: ["/usr/local/bin/kh-debug-pairgen"]
-    restart: "no"
-    volumes:
-      - pair_a:/provision/auth
-      - pair_b:/provision/mcp
-      - auth_state:/provision/state
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-
-  auth:
-    image: kh-debug-auth:local
-    depends_on:
-      pairgen:
-        condition: service_completed_successfully
     restart: unless-stopped
-    expose: ["41371"]
+    ports:
+      # Keep loopback-only. Use a secure private proxy for a remote client.
+      - "${KH_AUTH_HOST_BIND:-127.0.0.1}:41371:41371"
     environment:
       KH_AUTH_BIND: "0.0.0.0:41371"
       KH_AUTH_STATE_DIR: "/auth/state"
       KH_AUTH_API_TOKEN_FILE: "/auth/state/auth_api_token"
-      KH_AUTH_PAIR_A: "/auth/pair/A.png"
+      KH_AUTH_MCP_TOKEN_FILE: "/service/token"
+      KH_AUTH_MCP_MASTER_URL: "http://mcp:41370/internal/master-sha256"
+      KH_AUTH_LEASE_SECONDS: "${KH_AUTH_LEASE_SECONDS:-300}"
     volumes:
-      - pair_a:/auth/pair:ro
       - auth_state:/auth/state
+      - mcp_auth_service:/service
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=16m
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:41371/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:41371/health"]
       interval: 15s
       timeout: 5s
       start_period: 20s
@@ -54,13 +47,14 @@ services:
       - "127.0.0.1:41370:41370"
     environment:
       KH_DEBUG_BIND: "0.0.0.0:41370"
-      KH_DEBUG_IMAGE_DIR: "/data/screenshots"
       KH_DEBUG_ALLOWED_HOSTS: "localhost:41370,127.0.0.1:41370"
-      KH_DEBUG_PAIR_B: "/mcp/pair/B.png"
-      KH_DEBUG_AUTH_URL: "http://auth:41371/verify-pair"
+      KH_DEBUG_IMAGE_DIR: "/data/screenshots"
+      KH_DEBUG_MASTER_A: "/opt/kh-debug/master.png"
+      KH_DEBUG_SERVICE_TOKEN_FILE: "/service/token"
+      KH_DEBUG_AUTH_RELAY_URL: "http://auth:41371/relay/command"
     volumes:
       - screenshots:/data/screenshots
-      - pair_b:/mcp/pair:ro
+      - mcp_auth_service:/service:ro
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -76,9 +70,7 @@ services:
 volumes:
   screenshots:
     name: kh-debug-mcp-screenshots
-  pair_a:
-    name: kh-debug-pair-a
-  pair_b:
-    name: kh-debug-pair-b
   auth_state:
     name: kh-debug-auth-state
+  mcp_auth_service:
+    name: kh-debug-service-auth

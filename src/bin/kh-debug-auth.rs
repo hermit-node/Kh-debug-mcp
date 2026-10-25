@@ -1,6 +1,8 @@
 //! Independent StegoSplit verification gateway.
 //! Only delegates decisions to a separately supplied, trusted verifier.
 //! Does not implement or replace the existing StegoSplit A/B algorithm.
+#[path = "kh-debug-auth/relay.rs"]
+mod relay;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
@@ -29,6 +31,7 @@ struct Settings {
     state_dir: PathBuf,
     pair_a: Option<PathBuf>,
     python: Option<PythonBridge>,
+    relay: Option<Arc<relay::Relay>>,
 }
 
 fn authorized(headers: &HeaderMap, secret: &str) -> bool {
@@ -220,6 +223,44 @@ async fn reference_admin(
     }
 }
 
+/// MCP supplies master A, user-side agent supplies B. Auth decides using
+/// the existing StegoSplit v0.6 registry. Never accepts a client-selected A.
+async fn verify_images(
+    State(settings): State<Arc<Settings>>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    if settings.python.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"authorized":false})),
+        );
+    }
+    let a = body["a_png_base64"].as_str().unwrap_or("");
+    let b = body["b_png_base64"].as_str().unwrap_or("");
+    let user = body["expected_user"].as_str().unwrap_or("");
+    let password = body["password"].as_str().unwrap_or("");
+    if !acceptable_image(a)
+        || !acceptable_image(b)
+        || user.is_empty()
+        || user.len() > 128
+        || password.is_empty()
+        || password.len() > 256
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({"authorized":false})));
+    }
+    match reference_call(
+        &settings,
+        json!({"operation":"verify",
+        "a_png_base64":a,"b_png_base64":b,"expected_user":user,"password":password}),
+    )
+    .await
+    {
+        Ok(reply) if reply["authorized"] == true => (StatusCode::OK, Json(reply)),
+        Ok(_) => (StatusCode::UNAUTHORIZED, Json(json!({"authorized":false}))),
+        Err(status) => (status, Json(json!({"authorized":false}))),
+    }
+}
+
 async fn verify_pair(
     State(settings): State<Arc<Settings>>,
     Json(body): Json<Value>,
@@ -286,10 +327,45 @@ async fn verify_pair(
     }
 }
 
+fn ensure_token_file(path: &str, group_readable: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::path::Path::new(path);
+    #[cfg(not(unix))]
+    let _ = group_readable;
+    if file.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?
+    }
+    let mut random = [0u8; 32];
+    getrandom::fill(&mut random).map_err(|e| format!("secure OS randomness unavailable: {e:?}"))?;
+    let value: String = random.iter().map(|v| format!("{v:02x}")).collect();
+    use std::io::Write;
+    let mut handle = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file)?;
+    handle.write_all(value.as_bytes())?;
+    handle.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            file,
+            std::fs::Permissions::from_mode(if group_readable { 0o440 } else { 0o600 }),
+        )?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path =
         env::var("KH_AUTH_API_TOKEN_FILE").unwrap_or_else(|_| "/run/secrets/auth_api_token".into());
+    ensure_token_file(&path, false)?;
+    if let Ok(service_file) = env::var("KH_AUTH_MCP_TOKEN_FILE") {
+        ensure_token_file(&service_file, true)?;
+    }
     let api_token = std::fs::read_to_string(&path)?.trim().to_string();
     if api_token.len() < 32 {
         return Err("Auth API token file must contain at least 32 characters".into());
@@ -332,20 +408,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if pair_a.as_ref().is_some_and(|p| !p.is_file()) {
         return Err("Pairing A image missing".into());
     }
+    let relay = match (
+        env::var("KH_AUTH_MCP_MASTER_URL").ok(),
+        env::var("KH_AUTH_MCP_TOKEN_FILE").ok(),
+    ) {
+        (None, None) => None,
+        (Some(url), Some(file)) => {
+            if !url.starts_with("http://127.0.0.1:")
+                && !url.starts_with("http://localhost:")
+                && !url.starts_with("http://mcp:41370/")
+            {
+                return Err("Master A checksum endpoint must be private".into());
+            }
+            let token = std::fs::read_to_string(file)?.trim().to_owned();
+            if token.len() < 32 {
+                return Err("Auth/MCP shared service token is missing".into());
+            }
+            let seconds = env::var("KH_AUTH_LEASE_SECONDS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(300);
+            if !(5..=3600).contains(&seconds) {
+                return Err("Lease must be from 5 to 3600 seconds".into());
+            }
+            Some(Arc::new(relay::Relay::new(token, url, seconds)?))
+        }
+        _ => return Err("Both KH_AUTH_MCP_MASTER_URL and KH_AUTH_MCP_TOKEN_FILE required".into()),
+    };
     let settings = Arc::new(Settings {
         api_token,
         state_dir,
         verifier,
         pair_a,
         python,
+        relay,
     });
     let bind = env::var("KH_AUTH_BIND").unwrap_or_else(|_| "127.0.0.1:41371".into());
     let app = Router::new()
         .route("/health", get(health))
         .route("/verify", post(verify))
         .route("/verify-pair", post(verify_pair))
+        .route("/verify-images", post(verify_images))
         .route("/reference/admin", post(reference_admin))
-        .layer(DefaultBodyLimit::max(14 * 1024 * 1024))
+        .route("/agent/login", post(relay::login))
+        .route("/agent/next", post(relay::next))
+        .route("/agent/result", post(relay::result))
+        .route("/relay/command", post(relay::command))
+        .layer(DefaultBodyLimit::max(28 * 1024 * 1024))
         .with_state(settings);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     eprintln!("Auth Server listening on {bind} (verification fails closed without StegoSplit)");

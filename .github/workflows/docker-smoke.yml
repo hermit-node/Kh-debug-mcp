@@ -1,4 +1,4 @@
-name: Docker A/B pairing and MCP smoke test
+name: Docker AuthGate-only relay test
 
 on:
   push:
@@ -6,72 +6,86 @@ on:
   pull_request:
 
 jobs:
-  docker-smoke:
+  relay:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Validate Compose structure
+      - name: Validate Compose configuration
         run: docker compose config --quiet
-      - name: Build and launch paired containers
+      - name: Build and start MCP plus AuthGate
         run: |
           docker compose up -d --build
           for i in $(seq 1 100); do
-            if curl -fsS http://127.0.0.1:41370/health >/dev/null; then break; fi
+            if curl -fsS http://127.0.0.1:41370/health >/dev/null &&
+               curl -fsS http://127.0.0.1:41371/health >/dev/null; then break; fi
             sleep 2
           done
           curl -fsS http://127.0.0.1:41370/health
-          docker compose ps -a
-      - name: Confirm private A and B are distinct and persisted
+          curl -fsS http://127.0.0.1:41371/health
+      - name: Test checksum gate and no direct agent endpoint on MCP
         run: |
-          docker compose run --rm --no-deps --entrypoint /bin/sh pairgen -c \
-            'test -s /provision/auth/A.png && test -s /provision/mcp/B.png && ! cmp -s /provision/auth/A.png /provision/mcp/B.png'
-          docker compose logs pairgen
-      - name: Verify authenticated MCP executes PowerShell
+          set -euo pipefail
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+             -d '{}' http://127.0.0.1:41370/agent/login)
+          test "$code" = 404
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+             -d '{"user_id":"testagent","b_png_base64":"iVBORw0KGgo="}' \
+             http://127.0.0.1:41371/agent/login)
+          test "$code" = 401
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+             -d '{"command":"Write-Output BYPASS"}' http://127.0.0.1:41371/relay/command)
+          test "$code" = 401
+          echo "Direct agent bypass, unmatched B, unauthenticated relay all denied"
+      - name: Test remote job goes through AuthGate and result returns to MCP
         run: |
-          curl -fsS http://127.0.0.1:41370/mcp \
+          set -euo pipefail
+          b=$(base64 -w0 assets/kernelhermit-default.png)
+          printf '{"user_id":"testagent","b_png_base64":"%s"}' "$b" > "$RUNNER_TEMP/login.json"
+          curl -fsS http://127.0.0.1:41371/agent/login \
+            -H 'Content-Type: application/json' --data-binary @"$RUNNER_TEMP/login.json" \
+            > "$RUNNER_TEMP/login-result.json"
+          token=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['session_token'])" "$RUNNER_TEMP/login-result.json")
+          (curl -fsS http://127.0.0.1:41370/mcp \
             -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' \
-            | grep 'kh-debug-mcp'
-          curl -fsS http://127.0.0.1:41370/mcp \
-            -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_powershell","arguments":{"command":"Write-Output PAIRED_MCP_READY"}}}' \
-            | grep 'PAIRED_MCP_READY'
-      - name: Reject invalid pair and stop commands when Auth is offline
+            -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_remote_powershell","arguments":{"command":"Write-Output AUTHGATE_ROUTED","target_user":"testagent","timeout_seconds":10}}}' \
+            > "$RUNNER_TEMP/remote-response.json") &
+          request_pid=$!
+          sleep 1
+          curl -fsS http://127.0.0.1:41371/agent/next \
+            -X POST -H "Authorization: Bearer $token" > "$RUNNER_TEMP/job.json"
+          job=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['job_id'])" "$RUNNER_TEMP/job.json")
+          test "$job" != None
+          printf '{"job_id":%s,"output":{"content":[{"type":"text","text":"SIMULATED_REMOTE_RESULT"}],"isError":false}}' "$job" \
+             > "$RUNNER_TEMP/result.json"
+          curl -fsS http://127.0.0.1:41371/agent/result -H "Authorization: Bearer $token" \
+             -H 'Content-Type: application/json' --data-binary @"$RUNNER_TEMP/result.json" \
+             | grep '"accepted":true'
+          wait "$request_pid"
+          grep SIMULATED_REMOTE_RESULT "$RUNNER_TEMP/remote-response.json"
+      - name: Test AuthGate shutdown fails closed while MCP stays up
         run: |
-          docker compose exec -T auth curl -sS -o /dev/null -w '%{http_code}' \
-            -H 'Content-Type: application/json' \
-            -d '{"b_png_base64":"incorrect"}' http://127.0.0.1:41371/verify-pair \
-            | grep '^400$'
+          set -euo pipefail
           docker compose stop auth
+          curl -fsS http://127.0.0.1:41370/health >/dev/null
           curl -fsS http://127.0.0.1:41370/mcp \
             -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_powershell","arguments":{"command":"Write-Output MUST_NOT_RUN"}}}' \
-            | grep 'A/B image pairing not authorized'
+            -d '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run_remote_powershell","arguments":{"command":"Write-Output MUST_NOT_RUN"}}}' \
+            | grep 'AuthGate unavailable'
           docker compose start auth
-          for i in $(seq 1 30); do
-            if docker compose exec -T auth curl -fsS http://127.0.0.1:41371/health >/dev/null; then break; fi
-            sleep 2
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:41371/health >/dev/null; then break; fi
+            sleep 1
           done
-      - name: Verify screenshots persist across MCP restart
-        run: |
-          png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2sX9sAAAAASUVORK5CYII='
-          printf '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"save_image","arguments":{"name":"persisted","png_base64":"%s"}}}' "$png" \
-            | curl -fsS http://127.0.0.1:41370/mcp -H 'Content-Type: application/json' --data-binary @- \
-            | grep '"isError":false'
-          docker compose restart mcp
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:41370/health >/dev/null; then break; fi
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:41370/mcp \
-            -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_images","arguments":{}}}' \
-            | grep 'persisted.png'
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+             -H "Authorization: Bearer $(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['session_token'])" "$RUNNER_TEMP/login-result.json")" \
+             http://127.0.0.1:41371/agent/next)
+          test "$code" = 401
+          echo "AuthGate outage blocks MCP; old agent token is rejected after restart"
       - name: Show logs on failure
         if: failure()
-        run: docker compose logs --no-color --tail=150
-      - name: Remove only ephemeral CI containers and volumes
+        run: docker compose logs --tail=150 --no-color
+      - name: Remove only ephemeral CI resources
         if: always()
         run: docker compose down -v --remove-orphans

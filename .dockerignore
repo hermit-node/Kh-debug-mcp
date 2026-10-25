@@ -5,6 +5,7 @@ secrets
 screenshots
 .env
 *.png
+!assets/kernelhermit-default.png
 *.key
 *.pem
 *.sqlite3
