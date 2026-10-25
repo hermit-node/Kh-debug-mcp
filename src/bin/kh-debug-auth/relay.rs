@@ -241,7 +241,10 @@ pub async fn command(
     let target = body["target_user"].as_str();
     let shell = body["shell"].as_str().unwrap_or("powershell");
     if !matches!(shell, "powershell" | "sh") {
-        return response(StatusCode::BAD_REQUEST, json!({"error":"unsupported shell type"}));
+        return response(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"unsupported shell type"}),
+        );
     }
     if cmd.is_empty() || cmd.len() > 8192 || !(1..=120).contains(&seconds) {
         return response(

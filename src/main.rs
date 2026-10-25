@@ -44,7 +44,13 @@ impl McpRelay {
         token.len() == self.secret.len()
             && bool::from(token.as_bytes().ct_eq(self.secret.as_bytes()))
     }
-    async fn command(&self, script: &str, seconds: u64, target: Option<&str>, shell: &str) -> Value {
+    async fn command(
+        &self,
+        script: &str,
+        seconds: u64,
+        target: Option<&str>,
+        shell: &str,
+    ) -> Value {
         let reply = self
             .client
             .post(&self.auth_url)
@@ -112,9 +118,15 @@ fn tool_result(text: String, is_error: bool) -> Value {
 
 fn remote_tool(shell_mode: &str) -> Value {
     let (name, description) = if shell_mode == "sh" {
-        ("run_remote_shell", "Execute a /bin/sh script inside an authenticated Linux user-agent container, routed exclusively through AuthGate.")
+        (
+            "run_remote_shell",
+            "Execute a /bin/sh script inside an authenticated Linux user-agent container, routed exclusively through AuthGate.",
+        )
     } else {
-        ("run_remote_powershell", "Execute PowerShell in an authenticated Windows diagnostic EXE, routed exclusively through AuthGate.")
+        (
+            "run_remote_powershell",
+            "Execute PowerShell in an authenticated Windows diagnostic EXE, routed exclusively through AuthGate.",
+        )
     };
     json!({"name":name,
         "description":description,
@@ -302,7 +314,16 @@ async fn call_tool(state: &AppState, name: &str, args: &Value) -> Value {
                 return tool_result("Invalid remote command".into(), true);
             }
             relay
-                .command(command, seconds, args["target_user"].as_str(), if name == "run_remote_shell" {"sh"} else {"powershell"})
+                .command(
+                    command,
+                    seconds,
+                    args["target_user"].as_str(),
+                    if name == "run_remote_shell" {
+                        "sh"
+                    } else {
+                        "powershell"
+                    },
+                )
                 .await
         }
         "list_images" => match state.images.list().await {

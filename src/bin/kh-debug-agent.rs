@@ -21,8 +21,18 @@ async fn execute(command: &str, seconds: u64, requested_shell: &str) -> Value {
             process
         }
         "powershell" => {
-            let mut process = Command::new(if cfg!(windows) { "powershell.exe" } else { "pwsh" });
-            process.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]);
+            let mut process = Command::new(if cfg!(windows) {
+                "powershell.exe"
+            } else {
+                "pwsh"
+            });
+            process.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command,
+            ]);
             process
         }
         _ => {
