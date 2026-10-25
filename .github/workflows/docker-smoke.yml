@@ -1,4 +1,4 @@
-name: Docker build and MCP smoke test
+name: Docker A/B pairing and MCP smoke test
 
 on:
   push:
@@ -12,67 +12,66 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Validate Docker Compose
+      - name: Validate Compose structure
         run: docker compose config --quiet
-      - name: Build Linux image
-        run: docker build --pull -t kh-debug-mcp:test .
-      - name: Start isolated MCP server
+      - name: Build and launch paired containers
         run: |
-          docker volume create kh-debug-mcp-smoke-images
-          docker run -d --name kh-debug-mcp-smoke \
-            -p 127.0.0.1:41370:41370 \
-            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-            --tmpfs /tmp:rw,nosuid,nodev,size=16m \
-            -e KH_DEBUG_BIND=0.0.0.0:41370 \
-            -e KH_DEBUG_IMAGE_DIR=/data/images \
-            -v kh-debug-mcp-smoke-images:/data/images \
-            kh-debug-mcp:test
-          for i in $(seq 1 45); do
-            if curl -fsS http://127.0.0.1:41370/health; then exit 0; fi
+          docker compose up -d --build
+          for i in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:41370/health >/dev/null; then break; fi
             sleep 2
           done
-          docker logs kh-debug-mcp-smoke
-          exit 1
-      - name: Verify MCP initializes and executes PowerShell inside Docker
+          curl -fsS http://127.0.0.1:41370/health
+          docker compose ps -a
+      - name: Confirm private A and B are distinct and persisted
+        run: |
+          docker compose run --rm --no-deps --entrypoint /bin/sh pairgen -c \
+            'test -s /provision/auth/A.png && test -s /provision/mcp/B.png && ! cmp -s /provision/auth/A.png /provision/mcp/B.png'
+          docker compose logs pairgen
+      - name: Verify authenticated MCP executes PowerShell
         run: |
           curl -fsS http://127.0.0.1:41370/mcp \
             -H 'Content-Type: application/json' \
-            -H 'Accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' \
             | grep 'kh-debug-mcp'
           curl -fsS http://127.0.0.1:41370/mcp \
             -H 'Content-Type: application/json' \
-            -H 'Accept: application/json, text/event-stream' \
-            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_powershell","arguments":{"command":"Write-Output MCP_DOCKER_TEST"}}}' \
-            | grep 'MCP_DOCKER_TEST'
-      - name: Verify PNG storage persists across container recreation
+            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_powershell","arguments":{"command":"Write-Output PAIRED_MCP_READY"}}}' \
+            | grep 'PAIRED_MCP_READY'
+      - name: Reject invalid pair and stop commands when Auth is offline
         run: |
-          image='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2sX9sAAAAASUVORK5CYII='
-          printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"save_image","arguments":{"name":"persisted","png_base64":"%s"}}}' "$image" \
-            | curl -fsS http://127.0.0.1:41370/mcp \
-                -H 'Content-Type: application/json' \
-                -H 'Accept: application/json, text/event-stream' \
-                --data-binary @- | grep '"isError":false'
-          docker rm -f kh-debug-mcp-smoke
-          docker run -d --name kh-debug-mcp-smoke \
-            -p 127.0.0.1:41370:41370 \
-            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-            --tmpfs /tmp:rw,nosuid,nodev,size=16m \
-            -e KH_DEBUG_BIND=0.0.0.0:41370 \
-            -e KH_DEBUG_IMAGE_DIR=/data/images \
-            -v kh-debug-mcp-smoke-images:/data/images \
-            kh-debug-mcp:test
-          for i in $(seq 1 45); do
+          docker compose exec -T auth curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -d '{"b_png_base64":"incorrect"}' http://127.0.0.1:41371/verify-pair \
+            | grep '^400$'
+          docker compose stop auth
+          curl -fsS http://127.0.0.1:41370/mcp \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_powershell","arguments":{"command":"Write-Output MUST_NOT_RUN"}}}' \
+            | grep 'A/B image pairing not authorized'
+          docker compose start auth
+          for i in $(seq 1 30); do
+            if docker compose exec -T auth curl -fsS http://127.0.0.1:41371/health >/dev/null; then break; fi
+            sleep 2
+          done
+      - name: Verify screenshots persist across MCP restart
+        run: |
+          png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2sX9sAAAAASUVORK5CYII='
+          printf '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"save_image","arguments":{"name":"persisted","png_base64":"%s"}}}' "$png" \
+            | curl -fsS http://127.0.0.1:41370/mcp -H 'Content-Type: application/json' --data-binary @- \
+            | grep '"isError":false'
+          docker compose restart mcp
+          for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:41370/health >/dev/null; then break; fi
             sleep 2
           done
           curl -fsS http://127.0.0.1:41370/mcp \
             -H 'Content-Type: application/json' \
-            -H 'Accept: application/json, text/event-stream' \
-            -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_images","arguments":{}}}' \
+            -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_images","arguments":{}}}' \
             | grep 'persisted.png'
-      - name: Clean up test container and volume
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=150
+      - name: Remove only ephemeral CI containers and volumes
         if: always()
-        run: |
-          docker rm -f kh-debug-mcp-smoke || true
-          docker volume rm kh-debug-mcp-smoke-images || true
+        run: docker compose down -v --remove-orphans

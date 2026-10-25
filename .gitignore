@@ -8,4 +8,6 @@
 *.png
 *.sqlite3
 *.db
+/secrets/
+/screenshots/
 /dist

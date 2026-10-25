@@ -6,7 +6,7 @@ pub fn list_tool() -> Value {
         "annotations":{"readOnlyHint":true}})
 }
 pub fn save_tool() -> Value {
-    json!({"name":"save_image","description":"Store a PNG in the persistent image volume without replacing existing files. Each PNG may be up to 4 MiB.",
+    json!({"name":"save_image","description":"Store a PNG in the persistent image volume without replacing existing files. Each PNG may be up to 10 MiB.",
         "inputSchema":{"type":"object","properties":{
             "name":{"type":"string","description":"Name without .png, letters/digits/-/_ only"},
             "png_base64":{"type":"string","description":"Base64-encoded original PNG bytes"}

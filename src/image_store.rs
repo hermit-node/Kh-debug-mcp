@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
 
 const MAX_IMAGES: usize = 96;
-const MAX_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BYTES: usize = 10 * 1024 * 1024;
 const PNG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
 pub struct ImageStore {
@@ -27,7 +27,9 @@ impl ImageStore {
             lock: Mutex::new(()),
         };
         if store.list().await?.len() > MAX_IMAGES {
-            return Err(std::io::Error::other("more than five PNGs in image volume"));
+            return Err(std::io::Error::other(
+                "more than 96 PNGs in screenshot volume",
+            ));
         }
         Ok(store)
     }
@@ -55,7 +57,7 @@ impl ImageStore {
             .decode(encoded)
             .map_err(|_| "invalid base64 data")?;
         if bytes.len() > MAX_BYTES || !bytes.starts_with(&PNG) {
-            return Err("PNG data required (maximum 4 MiB)".into());
+            return Err("PNG data required (maximum 10 MiB)".into());
         }
         let _guard = self.lock.lock().await;
         if self.list().await.map_err(|e| e.to_string())?.len() >= MAX_IMAGES {

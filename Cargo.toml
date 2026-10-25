@@ -1,15 +1,20 @@
 [package]
 name = "kh-debug-mcp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
-description = "Portable Rust Streamable HTTP MCP server with PowerShell and a five-PNG volume"
+description = "Portable Rust MCP server, 96 screenshots, and separate Auth Server"
 
 [dependencies]
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 base64 = "0.22"
+subtle = "2"
+png = "0.17"
+sha2 = "0.10"
+getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tower = "0.5"

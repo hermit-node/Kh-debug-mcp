@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::process::Command;
@@ -20,6 +21,32 @@ const DEFAULT_ADDRESS: &str = "127.0.0.1:41370";
 struct AppState {
     images: ImageStore,
     allowed_hosts: Vec<String>,
+    pair_gate: Option<PairGate>,
+}
+struct PairGate {
+    url: String,
+    b_png_base64: String,
+    client: reqwest::Client,
+}
+impl PairGate {
+    async fn authorized(&self) -> bool {
+        let req = self
+            .client
+            .post(&self.url)
+            .json(&json!({"b_png_base64": self.b_png_base64}))
+            .send()
+            .await;
+        let Ok(reply) = req else {
+            return false;
+        };
+        if !reply.status().is_success() {
+            return false;
+        }
+        reply
+            .json::<Value>()
+            .await
+            .is_ok_and(|body| body["authorized"] == true)
+    }
 }
 const MAX_COMMAND_LENGTH: usize = 8192;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -164,6 +191,11 @@ async fn mcp(
             json!({"tools":[tool_definition(),image_tools::list_tool(),image_tools::save_tool(),image_tools::delete_tool()]}),
         ),
         "tools/call" => {
+            if let Some(gate) = &state.pair_gate {
+                if !gate.authorized().await {
+                    return rpc_error(id, -32001, "A/B image pairing not authorized");
+                }
+            }
             let Some(params) = request.get("params") else {
                 return rpc_error(id, -32602, "Missing params");
             };
@@ -221,18 +253,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let allowed_hosts = allowed.split(',').map(|s| s.trim().to_string()).collect();
     let images = ImageStore::new(
         env::var("KH_DEBUG_IMAGE_DIR")
-            .unwrap_or_else(|_| "./images".into())
+            .unwrap_or_else(|_| "./screenshots".into())
             .into(),
     )
     .await?;
+    let pair_gate = match (
+        env::var("KH_DEBUG_AUTH_URL").ok(),
+        env::var("KH_DEBUG_PAIR_B").ok(),
+    ) {
+        (None, None) => None, // Legacy native Windows mode, no pairing configured.
+        (Some(url), Some(path)) => {
+            if !url.starts_with("http://auth:41371/") && !url.starts_with("http://127.0.0.1:") {
+                return Err("Auth URL must refer to private Auth Server".into());
+            }
+            let png = tokio::fs::read(path).await?;
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()?;
+            Some(PairGate {
+                url,
+                b_png_base64: STANDARD.encode(png),
+                client,
+            })
+        }
+        _ => return Err("Both KH_DEBUG_AUTH_URL and KH_DEBUG_PAIR_B are required".into()),
+    };
+    if let Some(gate) = &pair_gate {
+        if !gate.authorized().await {
+            return Err("A/B image pairing failed: MCP will not listen".into());
+        }
+    }
     let state = Arc::new(AppState {
         images,
         allowed_hosts,
+        pair_gate,
     });
     let app = Router::new()
         .route("/health", get(health))
         .route("/mcp", post(mcp))
-        .layer(DefaultBodyLimit::max(6 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(14 * 1024 * 1024))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("KH Debug MCP listening at http://{bind}/mcp");

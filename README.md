@@ -12,14 +12,36 @@ docker compose up -d --build
 
 - Docker host endpoint: `http://127.0.0.1:41370/mcp`
 - Health check: `http://127.0.0.1:41370/health`
-- Persistent Docker volume: `kh-debug-mcp-images`, mounted at `/data/images`.
-- Each PNG is limited to 4 MiB. Images are not recompressed or modified.
+- Persistent Docker volume: `kh-debug-mcp-screenshots`, mounted at `/data/screenshots`.
+- Each PNG is limited to 10 MiB. Images are not recompressed or modified.
 - The **96-image maximum** is enforced by the Rust image-store implementation.
 - Tools: `run_powershell`, `list_images`, `save_image` (base64 PNG), `delete_image`.
 - Docker starts automatically after reboots, unless you explicitly stop the service.
 - No Windows OpenSSH service, Docker socket mount, or host administrator access is required.
 
 **Important:** PowerShell in Docker executes **inside the Linux container**, not on the physical Docker host. It uses PowerShell 7 (`pwsh`), which does not supply Windows-only cmdlets. To diagnose the Windows host itself, use the native Windows EXE below instead. The Docker image requires a supported Linux/CPU architecture and has not been validated on every Docker platform.
+
+## Separate Auth Server Dockerfile
+
+Compose automatically launches a short-lived pairing generator, the independent
+**Rust Auth Server** (built using `Dockerfile.auth`) and the MCP. It creates a
+mathematical brush-stroke **A/B PNG pair with a random 64-bit key** on first run;
+A remains with Auth and B remains with MCP. Both are required for the MCP to
+start and accept command tools. To build Auth separately:
+
+```bash
+docker build -f Dockerfile.auth -t kh-debug-auth:local .
+```
+
+The PNG pairing is a new experimental Rust implementation and **not compatible
+with the Windows-only StegoSplit v0.6 binary codec**. Existing StegoSplit
+verification remains a separate optional integration. The 64-bit key is
+weaker than modern authentication keys and this is not a production-grade
+access-control system.
+
+See [AUTH_SERVER.md](AUTH_SERVER.md) for provisioning, separated persistent
+pairing volumes, verification flow, and security limitations. No master
+passphrase is required.
 
 ## Native Windows executable
 
@@ -29,7 +51,7 @@ cargo build --release
 .\target\release\kh-debug-mcp.exe
 ```
 
-Native Windows PowerShell runs in the context of the Windows user who starts the EXE. On native Windows the server defaults to `127.0.0.1:41370`; images default to a local `./images` directory.
+Native Windows PowerShell runs in the context of the Windows user who starts the EXE. On native Windows the server defaults to `127.0.0.1:41370`; images default to a local `./screenshots` directory.
 
 ## ChatGPT integration
 

@@ -1,17 +1,66 @@
 name: kh-debug-mcp
 services:
+  pairgen:
+    build:
+      context: .
+      dockerfile: Dockerfile.auth
+    image: kh-debug-auth:local
+    entrypoint: ["/usr/local/bin/kh-debug-pairgen"]
+    restart: "no"
+    volumes:
+      - pair_a:/provision/auth
+      - pair_b:/provision/mcp
+      - auth_state:/provision/state
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  auth:
+    image: kh-debug-auth:local
+    depends_on:
+      pairgen:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    expose: ["41371"]
+    environment:
+      KH_AUTH_BIND: "0.0.0.0:41371"
+      KH_AUTH_STATE_DIR: "/auth/state"
+      KH_AUTH_API_TOKEN_FILE: "/auth/state/auth_api_token"
+      KH_AUTH_PAIR_A: "/auth/pair/A.png"
+    volumes:
+      - pair_a:/auth/pair:ro
+      - auth_state:/auth/state
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:41371/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
   mcp:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: kh-debug-mcp:local
+    depends_on:
+      auth:
+        condition: service_healthy
     restart: unless-stopped
     ports:
       - "127.0.0.1:41370:41370"
     environment:
       KH_DEBUG_BIND: "0.0.0.0:41370"
-      KH_DEBUG_IMAGE_DIR: "/data/images"
+      KH_DEBUG_IMAGE_DIR: "/data/screenshots"
       KH_DEBUG_ALLOWED_HOSTS: "localhost:41370,127.0.0.1:41370"
+      KH_DEBUG_PAIR_B: "/mcp/pair/B.png"
+      KH_DEBUG_AUTH_URL: "http://auth:41371/verify-pair"
     volumes:
-      - images:/data/images
+      - screenshots:/data/screenshots
+      - pair_b:/mcp/pair:ro
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -23,6 +72,13 @@ services:
       timeout: 10s
       start_period: 30s
       retries: 3
+
 volumes:
-  images:
-    name: kh-debug-mcp-images
+  screenshots:
+    name: kh-debug-mcp-screenshots
+  pair_a:
+    name: kh-debug-pair-a
+  pair_b:
+    name: kh-debug-pair-b
+  auth_state:
+    name: kh-debug-auth-state

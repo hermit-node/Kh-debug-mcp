@@ -1,6 +1,8 @@
 target
 .git
 dist
+secrets
+screenshots
 .env
 *.png
 *.key
