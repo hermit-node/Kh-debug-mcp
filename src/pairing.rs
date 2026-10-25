@@ -1,13 +1,15 @@
 //! Experimental independent A/B PNG pairing (not the Windows StegoSplit v0.6 codec).
 //! A contains SHA-256(key); B contains the random 64-bit key.
-//! Both are derived from the same mathematically drawn background.
+//! Both are derived from the same default KernelHermit PNG or a selected RGB PNG.
 use sha2::{Digest, Sha256};
 use std::{io::Cursor, path::Path};
 use subtle::ConstantTimeEq;
 
-const W: usize = 320;
-const H: usize = 240;
+const W: usize = 640;
+const H: usize = 360;
 const PIXELS: usize = W * H;
+// This artwork is prepared as RGB PNG before any pairing data is written.
+const DEFAULT_ART: &[u8] = include_bytes!("../assets/kernelhermit-default.png");
 const MASK_PIXELS: usize = 288; // 36 bytes in A, 12 bytes in B
 const PNG_MAX: usize = 10 * 1024 * 1024;
 const A_TAG: &[u8; 4] = b"KHA1";
@@ -15,64 +17,6 @@ const B_TAG: &[u8; 4] = b"KHB1";
 
 fn random(buf: &mut [u8]) -> Result<(), String> {
     getrandom::fill(buf).map_err(|e| format!("OS randomness unavailable: {e:?}"))
-}
-struct Stream(u64);
-impl Stream {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn range(&mut self, max: usize) -> usize {
-        (self.next() as usize) % max
-    }
-}
-fn draw(seed: u64) -> Vec<u8> {
-    let mut p = vec![0u8; PIXELS * 3];
-    for pixel in p.chunks_exact_mut(3) {
-        pixel.copy_from_slice(&[239, 233, 219]);
-    }
-    let mut rng = Stream(seed | 1);
-    let colors: [[u8; 3]; 6] = [
-        [40, 82, 100],
-        [162, 84, 62],
-        [97, 114, 79],
-        [204, 148, 68],
-        [94, 73, 122],
-        [60, 125, 140],
-    ];
-    for _ in 0..38 {
-        let x0 = rng.range(W) as f64;
-        let y0 = rng.range(H) as f64;
-        let phase = rng.range(628) as f64 / 100.0;
-        let len = 14.0 + rng.range(95) as f64;
-        let width = 1.0 + rng.range(9) as f64;
-        let color = colors[rng.range(colors.len())];
-        for n in 0..(len as usize) {
-            let t = n as f64;
-            let x = (x0 + phase.cos() * t + (t / 11.0).sin() * 7.0).round() as i32;
-            let y = (y0 + phase.sin() * t + (t / 13.0).cos() * 6.0).round() as i32;
-            let radius = width * (0.2 + 0.8 * (std::f64::consts::PI * t / len).sin().abs());
-            for dy in -(radius as i32)..=(radius as i32) {
-                for dx in -(radius as i32)..=(radius as i32) {
-                    if (dx * dx + dy * dy) as f64 > radius * radius {
-                        continue;
-                    }
-                    let px = x + dx;
-                    let py = y + dy;
-                    if px < 0 || py < 0 || px >= W as i32 || py >= H as i32 {
-                        continue;
-                    }
-                    let i = ((py as usize * W + px as usize) * 3) as usize;
-                    for c in 0..3 {
-                        p[i + c] = ((p[i + c] as u16 + 2 * color[c] as u16) / 3) as u8;
-                    }
-                }
-            }
-        }
-    }
-    p
 }
 fn insert_bits(mut pixels: Vec<u8>, message: &[u8]) -> Vec<u8> {
     for (i, bit) in message
@@ -108,30 +52,32 @@ fn decode(png_bytes: &[u8]) -> Result<Vec<u8>, String> {
     if png_bytes.len() > PNG_MAX {
         return Err("PNG exceeds 10 MiB".into());
     }
-    let decoder = png::Decoder::new(Cursor::new(png_bytes));
+    // Expand an indexed-color default PNG to RGB8 *before* embedding.
+    // Credential PNGs are always written as lossless RGB PNGs.
+    let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
     let info = reader.info();
-    if info.width as usize != W
-        || info.height as usize != H
-        || info.color_type != png::ColorType::Rgb
-        || info.bit_depth != png::BitDepth::Eight
-    {
-        return Err("Unexpected image dimensions or pixel type".into());
+    if info.width as usize != W || info.height as usize != H {
+        return Err("Image must be 640x360 pixels".into());
     }
-    let mut buf = vec![0; PIXELS * 3];
+    let mut buf = vec![0; reader.output_buffer_size()];
     let output = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    if output.buffer_size() != buf.len() {
-        return Err("Incorrect pixel count".into());
+    if output.color_type != png::ColorType::Rgb
+        || output.bit_depth != png::BitDepth::Eight
+        || output.buffer_size() != PIXELS * 3
+    {
+        return Err("Image must decode to RGB8 pixels".into());
     }
+    buf.truncate(output.buffer_size());
     Ok(buf)
 }
-pub fn generate() -> Result<(Vec<u8>, Vec<u8>), String> {
-    let mut entropy = [0u8; 16];
-    random(&mut entropy)?;
+/// Generate the A/B images from a previously prepared 640x360 RGB PNG.
+/// Never resizes, quantizes, or otherwise transforms source pixels after embedding.
+pub fn generate_from_source(source: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let base = decode(source)?;
     let mut key = [0u8; 8];
-    key.copy_from_slice(&entropy[..8]);
-    let seed = u64::from_le_bytes(entropy[8..].try_into().unwrap());
-    let base = draw(seed);
+    random(&mut key)?;
     let mut a_message = Vec::from(*A_TAG);
     a_message.extend_from_slice(&Sha256::digest(key));
     let mut b_message = Vec::from(*B_TAG);
@@ -140,6 +86,11 @@ pub fn generate() -> Result<(Vec<u8>, Vec<u8>), String> {
         encode(&insert_bits(base.clone(), &a_message))?,
         encode(&insert_bits(base, &b_message))?,
     ))
+}
+
+/// Bundled default artwork is the geometric KernelHermit design in lossless RGB PNG.
+pub fn generate() -> Result<(Vec<u8>, Vec<u8>), String> {
+    generate_from_source(DEFAULT_ART)
 }
 pub fn verify(a: &[u8], b: &[u8]) -> bool {
     let (Ok(mut first), Ok(mut second)) = (decode(a), decode(b)) else {
@@ -154,7 +105,7 @@ pub fn verify(a: &[u8], b: &[u8]) -> bool {
     if !bool::from(hash.as_slice().ct_eq(&a_msg[4..36])) {
         return false;
     }
-    // The underlying painting must match exactly, ignoring only embedded red LSBs.
+    // The underlying artwork must match exactly, ignoring only embedded red LSBs.
     for i in 0..MASK_PIXELS {
         first[i * 3] &= !1;
         second[i * 3] &= !1;
@@ -175,5 +126,34 @@ mod tests {
         assert!(!verify(&a, &other));
         assert!(!verify(&b, &a));
         assert!(!verify(&a, &[1, 2, 3]));
+    }
+    #[test]
+    fn kernelhermit_art_is_preserved_except_embedded_bits() {
+        let source = decode(DEFAULT_ART).unwrap();
+        let (a, b) = generate().unwrap();
+        assert!(verify(&a, &b));
+        for result in [&a, &b] {
+            let reader = png::Decoder::new(std::io::Cursor::new(result))
+                .read_info()
+                .unwrap();
+            assert_eq!(reader.info().color_type, png::ColorType::Rgb);
+            assert_eq!(reader.info().bit_depth, png::BitDepth::Eight);
+            let pixels = decode(result).unwrap();
+            for i in 0..PIXELS {
+                for channel in 0..3 {
+                    if i < MASK_PIXELS && channel == 0 {
+                        continue;
+                    }
+                    assert_eq!(pixels[i * 3 + channel], source[i * 3 + channel]);
+                }
+            }
+        }
+    }
+    #[test]
+    fn alternate_prepared_rgb_png_can_be_used() {
+        let prepared = encode(&decode(DEFAULT_ART).unwrap()).unwrap();
+        let (a, b) = generate_from_source(&prepared).unwrap();
+        assert!(verify(&a, &b));
+        assert!(generate_from_source(b"not a PNG").is_err());
     }
 }

@@ -1,4 +1,4 @@
-# Auth Server and automatic A/B painting initialization
+# Auth Server and automatic KernelHermit A/B pairing
 
 Run the three-service Compose stack:
 
@@ -6,13 +6,14 @@ Run the three-service Compose stack:
 docker compose up -d --build
 ```
 
-**On the first startup only**, the short-lived `pairgen` container generates a mathematically
-painted RGB PNG pair from operating-system random data, with a **random 64-bit pairing key**.
+**On the first startup only**, the short-lived `pairgen` container loads the bundled
+geometric **KernelHermit** artwork, expands it to RGB pixels, and embeds a **fresh random
+64-bit pairing key** in a pair of losslessly encoded RGB PNGs.
 It embeds:
 - **A.png:** Pair verifier (SHA-256 of the 64-bit key), embedded in the artwork
 - **B.png:** The 64-bit key, embedded in the corresponding artwork
 
-The two PNGs share the same mathematical brush-stroke background. The Auth Server
+The two PNGs share the same KernelHermit artwork. The Auth Server
 can check both the concealed verifier/key relationship and the rest of the image.
 The images should look similar but are not byte-identical.
 
@@ -41,6 +42,19 @@ The Auth Server has **no published host port**. The MCP is published only on
 On restart, both images are reused unchanged. If one image is missing or tampered
 with, startup fails closed. Pairgen **never silently replaces** one image or
 regenerates an existing valid pair.
+
+## Default artwork and future custom-image selection
+
+The bundled default is `assets/kernelhermit-default.png`, prepared from the
+geometric KernelHermit design. The source PNG's palette is expanded to RGB8
+**before** embedding; the output A/B files are both lossless RGB PNG.
+
+A future UI can choose a different source image by mounting it read-only into
+`pairgen` and setting `KH_PAIR_SOURCE_IMAGE` to its absolute container path.
+The current prototype accepts a prepared **640 × 360 PNG** whose pixels decode
+to RGB8. It does not resize, apply filters, convert to WebP/JPEG, or otherwise
+alter any pixel *after* embedding. An existing pair is never regenerated solely
+because the selected source image changes.
 
 ## Dockerfiles
 

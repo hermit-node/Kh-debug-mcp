@@ -3,6 +3,7 @@ FROM rust:1-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
+COPY assets/ ./assets/
 RUN cargo build --locked --release --bin kh-debug-auth --bin kh-debug-pairgen -j 2
 
 FROM debian:bookworm-slim

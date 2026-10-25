@@ -25,7 +25,7 @@ docker compose up -d --build
 
 Compose automatically launches a short-lived pairing generator, the independent
 **Rust Auth Server** (built using `Dockerfile.auth`) and the MCP. It creates a
-mathematical brush-stroke **A/B PNG pair with a random 64-bit key** on first run;
+lossless **A/B PNG pair with a random 64-bit key** on first run;
 A remains with Auth and B remains with MCP. Both are required for the MCP to
 start and accept command tools. To build Auth separately:
 

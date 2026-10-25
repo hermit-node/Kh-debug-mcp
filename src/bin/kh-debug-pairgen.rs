@@ -20,10 +20,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     match (a.exists(), b.exists()) {
         (false, false) => {
-            let (master, client) = pairing::generate().map_err(std::io::Error::other)?;
+            // An explicit path may be supplied by the future UI. The default
+            // is the bundled geometric KernelHermit artwork, not a random painting.
+            let (master, client) = match std::env::var("KH_PAIR_SOURCE_IMAGE") {
+                Ok(path) => {
+                    let source = Path::new(&path);
+                    if !source.is_absolute() {
+                        return Err("Source image path must be absolute".into());
+                    }
+                    pairing::generate_from_source(&fs::read(source)?)
+                }
+                Err(std::env::VarError::NotPresent) => pairing::generate(),
+                Err(_) => return Err("Invalid source image path".into()),
+            }
+            .map_err(std::io::Error::other)?;
             save_new(a, &master)?;
             save_new(b, &client)?;
-            println!("Generated a mathematical brush-stroke A/B pair");
+            println!("Generated lossless A/B PNG pair using the selected artwork");
         }
         (true, true) => {
             if !pairing::verify_files(a, &fs::read(b)?) {
