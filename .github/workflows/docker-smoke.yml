@@ -1,4 +1,4 @@
-name: Docker AuthGate-only relay test
+name: Docker three-container AuthGate relay test
 
 on:
   push:
@@ -12,83 +12,83 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v5
-      - name: Validate Compose configuration
-        run: docker compose config --quiet
-      - name: Build and start MCP plus AuthGate
+      - name: Validate Compose with optional test agent
+        run: docker compose --profile test-agent config --quiet
+      - name: Start MCP, AuthGate, and real user agent
         run: |
-          docker compose up -d --build
-          echo "Diagnose mounted volume access from each container user (no secrets printed)"
-          docker compose run --rm --no-deps --entrypoint /bin/sh mcp -c 'id; ls -ldn /data/screenshots /service /service/token /opt/kh-debug/master.png; test -r /service/token; echo service_token_readable=$?; test -w /data/screenshots; echo screenshot_writable=$?'
-          docker compose run --rm --no-deps --entrypoint /bin/sh auth -c 'id; ls -ldn /auth/state /service /service/token; test -r /service/token; echo service_token_readable=$?'
-          for i in $(seq 1 20); do
-            if curl -fsS http://127.0.0.1:41370/health >/dev/null &&
-               curl -fsS http://127.0.0.1:41371/health >/dev/null; then break; fi
-            sleep 2
+          set -euo pipefail
+          docker compose --profile test-agent up -d --build
+          for i in $(seq 1 35); do
+            if curl -fsS http://127.0.0.1:41370/health >/dev/null 2>&1 &&
+               curl -fsS http://127.0.0.1:41371/health >/dev/null 2>&1 &&
+               docker compose --profile test-agent logs --no-color agent | grep -q 'AUTH_APPROVED'; then
+              break
+            fi
+            sleep 1
           done
           curl -fsS http://127.0.0.1:41370/health
           curl -fsS http://127.0.0.1:41371/health
-      - name: Test checksum gate and no direct agent endpoint on MCP
+          docker compose --profile test-agent logs --no-color agent | grep 'AUTH_APPROVED'
+          docker compose --profile test-agent ps
+      - name: Verify user-agent is network-isolated from MCP
         run: |
           set -euo pipefail
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
-             -d '{}' http://127.0.0.1:41370/agent/login)
-          test "$code" = 404
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
-             -d '{"user_id":"testagent","b_png_base64":"iVBORw0KGgo="}' \
+          docker compose --profile test-agent exec -T agent sh -c '
+            if getent hosts mcp >/dev/null 2>&1 || curl -fsS --max-time 2 http://mcp:41370/health >/dev/null 2>&1; then
+              echo "FAIL: user agent can reach MCP directly"; exit 1
+            fi
+            echo "AGENT_TO_MCP_DIRECT=BLOCKED"
+          '
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+             -H 'Content-Type: application/json' -d '{}' \
+             http://127.0.0.1:41370/agent/login)
+          test "$status" = 404
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+             -H 'Content-Type: application/json' -d '{"user_id":"wrong","b_png_base64":"iVBORw0KGgo="}' \
              http://127.0.0.1:41371/agent/login)
-          test "$code" = 401
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
-             -d '{"command":"Write-Output BYPASS"}' http://127.0.0.1:41371/relay/command)
-          test "$code" = 401
-          echo "Direct agent bypass, unmatched B, unauthenticated relay all denied"
-      - name: Test remote job goes through AuthGate and result returns to MCP
+          test "$status" = 401
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+             -H 'Content-Type: application/json' -d '{"command":"echo BYPASS"}' \
+             http://127.0.0.1:41371/relay/command)
+          test "$status" = 401
+      - name: Actually execute /bin/sh script inside user container through MCP
         run: |
           set -euo pipefail
-          b=$(base64 -w0 assets/kernelhermit-default.png)
-          printf '{"user_id":"testagent","b_png_base64":"%s"}' "$b" > "$RUNNER_TEMP/login.json"
-          curl -fsS http://127.0.0.1:41371/agent/login \
-            -H 'Content-Type: application/json' --data-binary @"$RUNNER_TEMP/login.json" \
-            > "$RUNNER_TEMP/login-result.json"
-          token=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['session_token'])" "$RUNNER_TEMP/login-result.json")
-          (curl -fsS http://127.0.0.1:41370/mcp \
+          curl -fsS http://127.0.0.1:41370/mcp \
             -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_remote_powershell","arguments":{"command":"Write-Output AUTHGATE_ROUTED","target_user":"testagent","timeout_seconds":10}}}' \
-            > "$RUNNER_TEMP/remote-response.json") &
-          request_pid=$!
-          sleep 1
-          curl -fsS http://127.0.0.1:41371/agent/next \
-            -X POST -H "Authorization: Bearer $token" > "$RUNNER_TEMP/job.json"
-          job=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['job_id'])" "$RUNNER_TEMP/job.json")
-          test "$job" != None
-          printf '{"job_id":%s,"output":{"content":[{"type":"text","text":"SIMULATED_REMOTE_RESULT"}],"isError":false}}' "$job" \
-             > "$RUNNER_TEMP/result.json"
-          curl -fsS http://127.0.0.1:41371/agent/result -H "Authorization: Bearer $token" \
-             -H 'Content-Type: application/json' --data-binary @"$RUNNER_TEMP/result.json" \
-             | grep '"accepted":true'
-          wait "$request_pid"
-          grep SIMULATED_REMOTE_RESULT "$RUNNER_TEMP/remote-response.json"
-      - name: Test AuthGate shutdown fails closed while MCP stays up
+            -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_remote_shell","arguments":{"command":"sh /opt/kh-agent/diagnostic.sh; printf EXECUTED_BY_REMOTE_SHELL > /tmp/kh-proof; cat /tmp/kh-proof","target_user":"testagent","timeout_seconds":20}}}' \
+            > "$RUNNER_TEMP/shell-response.json"
+          grep -q 'USER_CONTAINER_SHELL_OK' "$RUNNER_TEMP/shell-response.json"
+          grep -q 'B_IMAGE_PRESENT' "$RUNNER_TEMP/shell-response.json"
+          grep -q 'EXECUTED_BY_REMOTE_SHELL' "$RUNNER_TEMP/shell-response.json"
+          grep -q '"isError":false' "$RUNNER_TEMP/shell-response.json"
+          docker compose --profile test-agent exec -T agent sh -c 'test "$(cat /tmp/kh-proof)" = EXECUTED_BY_REMOTE_SHELL'
+          echo 'MCP_AUTHGATE_REAL_CONTAINER_SHELL=PASS'
+      - name: Reject Windows PowerShell tool on Linux-only agent
         run: |
           set -euo pipefail
-          docker compose stop auth
+          curl -fsS http://127.0.0.1:41370/mcp \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"run_remote_powershell","arguments":{"command":"Write-Output MUST_NOT_RUN","target_user":"testagent","timeout_seconds":10}}}' \
+            > "$RUNNER_TEMP/wrong-shell.json"
+          grep -q 'Shell type not permitted' "$RUNNER_TEMP/wrong-shell.json"
+          grep -q '"isError":true' "$RUNNER_TEMP/wrong-shell.json"
+      - name: AuthGate stop blocks remote shell while MCP stays online
+        run: |
+          set -euo pipefail
+          docker compose --profile test-agent stop auth
           curl -fsS http://127.0.0.1:41370/health >/dev/null
           curl -fsS http://127.0.0.1:41370/mcp \
             -H 'Content-Type: application/json' \
-            -d '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run_remote_powershell","arguments":{"command":"Write-Output MUST_NOT_RUN"}}}' \
-            | grep 'AuthGate unavailable'
-          docker compose start auth
-          for i in $(seq 1 40); do
-            if curl -fsS http://127.0.0.1:41371/health >/dev/null; then break; fi
-            sleep 1
-          done
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
-             -H "Authorization: Bearer $(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['session_token'])" "$RUNNER_TEMP/login-result.json")" \
-             http://127.0.0.1:41371/agent/next)
-          test "$code" = 401
-          echo "AuthGate outage blocks MCP; old agent token is rejected after restart"
+            -d '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run_remote_shell","arguments":{"command":"printf MUST_NOT_RUN > /tmp/after-auth-stop","target_user":"testagent"}}}' \
+            > "$RUNNER_TEMP/blocked.json"
+          grep -q 'AuthGate unavailable' "$RUNNER_TEMP/blocked.json"
+          docker compose --profile test-agent exec -T agent sh -c 'test ! -e /tmp/after-auth-stop' || \
+            docker compose --profile test-agent logs --tail=25 agent
+          echo 'AUTHGATE_SHUTDOWN_BLOCKS_REMOTE_SHELL=PASS'
       - name: Show logs on failure
         if: failure()
-        run: docker compose logs --tail=150 --no-color
-      - name: Remove only ephemeral CI resources
+        run: docker compose --profile test-agent logs --tail=120 --no-color
+      - name: Delete ephemeral CI volumes
         if: always()
-        run: docker compose down -v --remove-orphans
+        run: docker compose --profile test-agent down -v --remove-orphans

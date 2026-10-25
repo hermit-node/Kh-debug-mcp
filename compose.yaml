@@ -1,5 +1,5 @@
 name: kh-debug-mcp
-# Two long-running, separate Docker services and one outbound user-side EXE.
+# MCP and AuthGate run by default; optional disposable user-agent container for real shell tests.
 # The AuthGate is the ONLY path between MCP and the user diagnostic agent.
 # In this SHA-only test, both pictures must contain identical lossless PNG bytes.
 services:
@@ -9,6 +9,9 @@ services:
       dockerfile: Dockerfile.auth
     image: kh-debug-auth:local
     restart: unless-stopped
+    networks:
+      - mcp_auth
+      - auth_agent
     ports:
       # Keep loopback-only. Use a secure private proxy for a remote client.
       - "${KH_AUTH_HOST_BIND:-127.0.0.1}:41371:41371"
@@ -45,6 +48,8 @@ services:
       auth:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - mcp_auth
     ports:
       - "127.0.0.1:41370:41370"
     environment:
@@ -68,6 +73,35 @@ services:
       timeout: 10s
       start_period: 30s
       retries: 3
+
+  agent:
+    profiles: ["test-agent"]
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: kh-debug-agent:local
+    depends_on:
+      mcp:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - auth_agent
+    environment:
+      KH_AGENT_AUTH_URL: "http://auth:41371"
+      KH_AGENT_USER: "testagent"
+      KH_AGENT_B: "/agent/B.png"
+      KH_AGENT_SHELL: "sh"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m
+
+networks:
+  mcp_auth:
+  auth_agent:
 
 volumes:
   screenshots:

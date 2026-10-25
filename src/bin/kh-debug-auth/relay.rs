@@ -42,6 +42,7 @@ struct Job {
     id: u64,
     command: String,
     seconds: u64,
+    shell: String,
 }
 struct Pending {
     token: String,
@@ -181,7 +182,7 @@ pub async fn next(
         Ok(Some(job)) => response(
             StatusCode::OK,
             json!({"job_id":job.id,
-            "command":job.command,"timeout_seconds":job.seconds}),
+            "command":job.command,"timeout_seconds":job.seconds,"shell":job.shell}),
         ),
         _ => response(StatusCode::OK, json!({"job_id":null})),
     }
@@ -238,6 +239,10 @@ pub async fn command(
     let cmd = body["command"].as_str().unwrap_or("");
     let seconds = body["timeout_seconds"].as_u64().unwrap_or(30);
     let target = body["target_user"].as_str();
+    let shell = body["shell"].as_str().unwrap_or("powershell");
+    if !matches!(shell, "powershell" | "sh") {
+        return response(StatusCode::BAD_REQUEST, json!({"error":"unsupported shell type"}));
+    }
     if cmd.is_empty() || cmd.len() > 8192 || !(1..=120).contains(&seconds) {
         return response(
             StatusCode::BAD_REQUEST,
@@ -277,6 +282,7 @@ pub async fn command(
             id,
             command: cmd.into(),
             seconds,
+            shell: shell.into(),
         })
         .await
         .is_err()

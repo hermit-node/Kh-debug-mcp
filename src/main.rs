@@ -44,12 +44,12 @@ impl McpRelay {
         token.len() == self.secret.len()
             && bool::from(token.as_bytes().ct_eq(self.secret.as_bytes()))
     }
-    async fn command(&self, script: &str, seconds: u64, target: Option<&str>) -> Value {
+    async fn command(&self, script: &str, seconds: u64, target: Option<&str>, shell: &str) -> Value {
         let reply = self
             .client
             .post(&self.auth_url)
             .bearer_auth(&self.secret)
-            .json(&json!({"command":script,"timeout_seconds":seconds,"target_user":target}))
+            .json(&json!({"command":script,"timeout_seconds":seconds,"target_user":target,"shell":shell}))
             .send()
             .await;
         let Ok(reply) = reply else {
@@ -110,9 +110,14 @@ fn tool_result(text: String, is_error: bool) -> Value {
     json!({"content":[{"type":"text","text":text}],"isError":is_error})
 }
 
-fn remote_tool() -> Value {
-    json!({"name":"run_remote_powershell",
-        "description":"Send PowerShell to a user diagnostic EXE through AuthGate only. AuthGate must remain online and authorize the session.",
+fn remote_tool(shell_mode: &str) -> Value {
+    let (name, description) = if shell_mode == "sh" {
+        ("run_remote_shell", "Execute a /bin/sh script inside an authenticated Linux user-agent container, routed exclusively through AuthGate.")
+    } else {
+        ("run_remote_powershell", "Execute PowerShell in an authenticated Windows diagnostic EXE, routed exclusively through AuthGate.")
+    };
+    json!({"name":name,
+        "description":description,
         "inputSchema":{"type":"object","properties":{
             "command":{"type":"string"},"target_user":{"type":"string"},
             "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
@@ -252,7 +257,8 @@ async fn mcp(
                 image_tools::delete_tool(),
             ];
             if state.relay.is_some() {
-                tools.push(remote_tool());
+                tools.push(remote_tool("powershell"));
+                tools.push(remote_tool("sh"));
             }
             rpc_ok(id, json!({"tools":tools}))
         }
@@ -283,7 +289,7 @@ async fn mcp(
 async fn call_tool(state: &AppState, name: &str, args: &Value) -> Value {
     match name {
         "run_powershell" => run_powershell(args).await,
-        "run_remote_powershell" => {
+        "run_remote_powershell" | "run_remote_shell" => {
             let Some(relay) = &state.relay else {
                 return tool_result("AuthGate not configured".into(), true);
             };
@@ -296,7 +302,7 @@ async fn call_tool(state: &AppState, name: &str, args: &Value) -> Value {
                 return tool_result("Invalid remote command".into(), true);
             }
             relay
-                .command(command, seconds, args["target_user"].as_str())
+                .command(command, seconds, args["target_user"].as_str(), if name == "run_remote_shell" {"sh"} else {"powershell"})
                 .await
         }
         "list_images" => match state.images.list().await {

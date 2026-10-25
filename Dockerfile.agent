@@ -1,0 +1,20 @@
+# Optional user-side sandbox for exercising the complete MCP -> AuthGate -> user path.
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+COPY assets/ ./assets/
+RUN cargo build --locked --release --bin kh-debug-agent -j 2
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10004 --create-home khagent \
+    && mkdir -p /agent /opt/kh-agent
+COPY --from=builder /build/target/release/kh-debug-agent /usr/local/bin/kh-debug-agent
+COPY assets/kernelhermit-default.png /agent/B.png
+COPY tests/container-agent/diagnostic.sh /opt/kh-agent/diagnostic.sh
+USER khagent
+ENV KH_AGENT_AUTH_URL=http://auth:41371 KH_AGENT_USER=testagent KH_AGENT_B=/agent/B.png KH_AGENT_SHELL=sh
+WORKDIR /home/khagent
+ENTRYPOINT ["/usr/local/bin/kh-debug-agent"]

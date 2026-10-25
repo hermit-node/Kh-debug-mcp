@@ -8,7 +8,8 @@ reference integration remains in `dev/` for future authentication.
 ## Roles
 
 1. **MCP (Docker)** holds **A**. ChatGPT connects to its Streamable HTTP MCP
-   endpoint and requests `run_remote_powershell`. MCP communicates with AuthGate
+   endpoint and requests `run_remote_powershell` (Windows) or `run_remote_shell` (Linux).
+   MCP communicates with AuthGate
    over a private authenticated service endpoint; it never connects directly to
    the diagnostic machine. An internal, token-protected endpoint returns only
    A's SHA-256 hash to AuthGate.
@@ -22,8 +23,10 @@ reference integration remains in `dev/` for future authentication.
    AuthGate stops/denies the session. There is no agent-side listening port,
    OpenSSH server, or permanent background installation.
 
-The two Docker services stay running together on a private Docker network. The
-user agent contacts AuthGate only. They use authenticated HTTP calls, **not yet
+The two production Docker services stay running together across separate
+networks: MCP is on `mcp_auth`, the optional test user is on `auth_agent`, and
+AuthGate joins both. The user agent **cannot resolve or reach MCP directly** and
+contacts AuthGate only. They use authenticated HTTP calls, **not yet
 a continuously open TCP/WebSocket tunnel**.
 
 ## Docker
@@ -44,6 +47,10 @@ and issuance routines have not been changed.
 - AuthGate: `http://127.0.0.1:41371` (host loopback only by default)
 - `Dockerfile`: MCP image with PowerShell 7 inside Linux container
 - `Dockerfile.auth`: independent AuthGate image
+- `Dockerfile.agent`: optional **real Linux user-agent container** with /bin/sh,
+  bundled B PNG, and no inbound ports; it is disabled by default.
+  Run `docker compose --profile test-agent up -d --build` to launch all
+  three containers for a shell-command test.
 - Persistent `kh-debug-mcp-screenshots`: **96 PNG files maximum**, **10 MiB
   each**, mounted as `/data/screenshots`
 - Persistent `kh-debug-auth-state`: future registry and private admin token
@@ -74,8 +81,13 @@ HTTPS. Do not send B over unsecured cross-machine HTTP.
 `dev/sha_relay_smoke.ps1` tests three separate Rust processes on **one Windows
 machine**, including no-AuthGate blocking, no direct MCP agent endpoint,
 mismatched B rejection, authorized command routing, AuthGate shutdown and
-agent disconnection. `.github/workflows/docker-smoke.yml` tests the two Docker
-containers on GitHub's runner with a simulated agent job.
+agent disconnection.
+
+`.github/workflows/docker-smoke.yml` tests **all three real containers** on
+GitHub's runner: MCP sends a shell script through AuthGate to the actual
+diagnostic agent, the agent executes /bin/sh and returns its real stdout.
+It checks Docker network separation, mismatched-B rejection, and AuthGate
+shutdown. The test script is `tests/container-agent/diagnostic.sh`.
 
 The original StegoSplit Python compatibility bridge and its working
 one-A/many-B tests remain in `dev/stegosplit_reference_bridge.py`. That
