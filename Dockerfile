@@ -11,7 +11,7 @@ RUN groupadd --gid 10001 khdebug && groupadd --gid 10003 khshared && useradd --u
     && mkdir -p /data/screenshots && chown -R 10001:10001 /data
 COPY --from=builder /build/target/release/kh-debug-mcp /usr/local/bin/kh-debug-mcp
 COPY assets/kernelhermit-default.png /opt/kh-debug/master.png
-USER 10001:10001
+USER khdebug
 ENV KH_DEBUG_BIND=0.0.0.0:41370 KH_DEBUG_IMAGE_DIR=/data/screenshots HOME=/tmp XDG_CONFIG_HOME=/tmp/.config
 WORKDIR /home/khdebug
 EXPOSE 41370
