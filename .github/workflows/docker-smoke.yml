@@ -30,6 +30,14 @@ jobs:
           curl -fsS http://127.0.0.1:41371/health
           docker compose --profile test-agent logs --no-color agent | grep 'AUTH_APPROVED'
           docker compose --profile test-agent ps
+      - name: Verify three separately mounted literal credential halves
+        run: |
+          set -euo pipefail
+          docker compose --profile test-agent exec -T auth sh -c 'test -r /opt/kh-auth/test-master.sha256; test ! -e /opt/kh-debug/a-half.txt && test ! -e /agent/b-half.txt'
+          docker compose --profile test-agent exec -T mcp sh -c 'test -r /opt/kh-debug/a-half.txt; test ! -e /opt/kh-auth/test-master.sha256 && test ! -e /agent/b-half.txt'
+          docker compose --profile test-agent exec -T agent sh -c 'test -r /agent/b-half.txt; test ! -e /opt/kh-auth/test-master.sha256 && test ! -e /opt/kh-debug/a-half.txt'
+          test "$(cat tests/fixtures/a-half.txt tests/fixtures/b-half.txt | tr -d '\n')" = "$(tr -d '\n' < tests/fixtures/master.sha256)"
+          echo MASTER_IN_AUTH_A_IN_MCP_B_IN_USER=PASS
       - name: Verify user-agent is network-isolated from MCP
         run: |
           set -euo pipefail
@@ -44,7 +52,7 @@ jobs:
              http://127.0.0.1:41370/agent/login)
           test "$status" = 404
           status=$(curl -sS -o /dev/null -w '%{http_code}' \
-             -H 'Content-Type: application/json' -d '{"user_id":"wrong","b_png_base64":"iVBORw0KGgo="}' \
+             -H 'Content-Type: application/json' -d '{"user_id":"wrong","b_half":"ffffffffffffffffffffffffffffffff"}' \
              http://127.0.0.1:41371/agent/login)
           test "$status" = 401
           status=$(curl -sS -o /dev/null -w '%{http_code}' \
@@ -59,7 +67,7 @@ jobs:
             -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_remote_shell","arguments":{"command":"sh /opt/kh-agent/diagnostic.sh; printf EXECUTED_BY_REMOTE_SHELL > /tmp/kh-proof; cat /tmp/kh-proof","target_user":"testagent","timeout_seconds":20}}}' \
             > "$RUNNER_TEMP/shell-response.json"
           grep -q 'USER_CONTAINER_SHELL_OK' "$RUNNER_TEMP/shell-response.json"
-          grep -q 'B_IMAGE_PRESENT' "$RUNNER_TEMP/shell-response.json"
+          grep -q 'B_HALF_PRESENT' "$RUNNER_TEMP/shell-response.json"
           grep -q 'EXECUTED_BY_REMOTE_SHELL' "$RUNNER_TEMP/shell-response.json"
           grep -q '"isError":false' "$RUNNER_TEMP/shell-response.json"
           docker compose --profile test-agent exec -T agent sh -c 'test "$(cat /tmp/kh-proof)" = EXECUTED_BY_REMOTE_SHELL'

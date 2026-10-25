@@ -1,44 +1,52 @@
-# AuthGate relay
+# AuthGate-only remote relay (v0.5.2 WIP)
 
-For current functionality, see [README.md](README.md).
+> **Proof of concept only. The public test half-strings are not secure authentication.**
 
-**MCP has A. User agent has B. AuthGate has neither installed as a
-credential file.** AuthGate asks MCP for A's checksum through an internal,
-bearer-authenticated HTTP endpoint; it computes B's SHA-256 from the submitted
-image. SHA equality admits the user-side agent to a short-lived relay session.
+## Ownership
 
-Flow:
+| Component | Owns | Test fixture |
+| --- | --- | --- |
+| AuthGate | Complete 64-character SHA-256-style master value | `tests/fixtures/master.sha256` |
+| MCP | First 32-character literal hex half (A) | `tests/fixtures/a-half.txt` |
+| User agent | Last 32-character literal hex half (B) | `tests/fixtures/b-half.txt` |
+
+All three fixtures contain values derived from the SHA-256 digest of the
+default KernelHermit PNG, **but no runtime image decoding is performed**.
+The master is installed only into AuthGate's container and is not mounted
+into MCP or the user agent. All fixtures are public and thus unsuitable
+for any real authentication use.
+
+At login, the user agent submits B directly to AuthGate. AuthGate obtains
+A from MCP using the privately networked and bearer-authenticated
+`GET /internal/a-half` endpoint. AuthGate concatenates `A + B` and
+compares it with its stored master. It repeats the check on every
+command, agent poll, and result acceptance, dropping the session if
+the master changes, a half mismatches, or MCP is unavailable.
 
 ```text
-ChatGPT -> MCP Docker (holds A) -> AuthGate Docker -> user diagnostic EXE (holds B)
-               ^                          ^
-               |__________________________|
-                AuthGate fetches A digest
+ChatGPT -> MCP [A] -> AuthGate [MASTER] -> User agent [B]
+             ^           |
+             +-----------+
+           AuthGate fetches A directly from MCP
 ```
 
-User agent calls AuthGate `/agent/login`, `/agent/next`, and
-`/agent/result`. MCP sends `POST /relay/command` to AuthGate using an
-automatically generated private service token. AuthGate rechecks the master
-checksum on login, command delivery, agent polling and result acceptance.
-It drops the session on mismatch, unavailable MCP or lease expiration.
+MCP sends commands through AuthGate's `/relay/command` endpoint, authenticated
+with a separate non-public service token. The agent uses AuthGate's
+`/agent/login`, `/agent/next`, and `/agent/result` endpoints.
+The two Docker networks prevent the user agent from contacting MCP
+directly. No direct inbound port is exposed by the user agent.
 
-If AuthGate stops or is deleted, MCP's remote PowerShell tool **fails closed**.
-The diagnostic EXE has no inbound network listener and loses access if AuthGate
-stops. Restarting AuthGate does not restore old in-memory session tokens; the
-agent must authenticate again.
+When AuthGate stops, **new relay commands fail closed**. Its old session
+tokens do not survive a restart. A shell process already launched in the
+user container could still finish locally.
 
-Docker binds AuthGate to host loopback by default; private HTTPS/TLS ingress
-is needed for real access from KH24 or another computer. Never publish the
-plain-HTTP test port to an untrusted network.
+## Future StegoSplit integration
 
-This is a temporary **checksum-only** test. Genuine StegoSplit A/B images
-differ at the pixel level and therefore won't pass this SHA equality gate.
-The existing Windows Python StegoSplit v0.6 implementation was separately
-verified for one A/many independent B credentials and is preserved in dev.
-It will replace SHA equality after the three-role tunnel tests are complete.
+Replace the *source of A and B data* with real decoded A/B images while
+keeping AuthGate in charge of the master and all authorization.
+The master must never be sent to MCP or the user agent.
+Implement individual B issuance, expiry, and revocation. The original
+Python v0.6 scripts in `dev/` are historical test references, **not**
+the Docker runtime or a current credential ownership model.
 
-The default artwork is a lossless PNG. No WebP, JPEG, recompression, resizing
-or post-embedding pixel modification is performed.
-
-`docker compose down` retains volumes. `docker compose down -v` destroys
-screenshots and internal Auth/MCP state and tokens.
+See [README.md](README.md) for installation and WIP limitations.
