@@ -10,7 +10,6 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::process::Command;
@@ -28,7 +27,7 @@ struct AppState {
 }
 struct McpRelay {
     secret: String,
-    master: std::path::PathBuf,
+    a_half_file: std::path::PathBuf,
     auth_url: String,
     client: reqwest::Client,
 }
@@ -359,16 +358,14 @@ async fn master_digest(
     if !relay.allowed(&headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({})));
     }
-    let Ok(bytes) = tokio::fs::read(&relay.master).await else {
+    let Ok(value) = tokio::fs::read_to_string(&relay.a_half_file).await else {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
     };
-    if bytes.len() > 10 * 1024 * 1024 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+    let part = value.trim();
+    if part.len() != 32 || !part.bytes().all(|c| c.is_ascii_hexdigit()) {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
     }
-    (
-        StatusCode::OK,
-        Json(json!({"sha256":format!("{:x}",Sha256::digest(bytes))})),
-    )
+    (StatusCode::OK, Json(json!({"a_half":part.to_ascii_lowercase()})))
 }
 
 async fn health() -> Json<Value> {
@@ -430,21 +427,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("A/B image pairing failed: MCP will not listen".into());
         }
     }
-    let relay=match (env::var("KH_DEBUG_MASTER_A").ok(),env::var("KH_DEBUG_AUTH_RELAY_URL").ok(),
+    let relay=match (env::var("KH_DEBUG_A_HALF_FILE").ok(),env::var("KH_DEBUG_AUTH_RELAY_URL").ok(),
         env::var("KH_DEBUG_SERVICE_TOKEN_FILE").ok()){
         (None,None,None)=>None,
         (Some(master),Some(url),Some(secret_file))=>{
             if !url.starts_with("http://127.0.0.1:") && !url.starts_with("http://auth:41371/") {
                 return Err("AuthGate relay URL must be private".into());
             }
-            let master=std::path::PathBuf::from(master);
-            if !master.is_absolute()||!master.is_file(){return Err("Master A file unavailable".into())}
+            let a_half_file=std::path::PathBuf::from(master);
+            if !a_half_file.is_absolute()||!a_half_file.is_file(){return Err("MCP A-half file unavailable".into())}
             let secret=tokio::fs::read_to_string(secret_file).await?.trim().to_owned();
             if secret.len()<32{return Err("MCP/Auth service token unavailable".into())}
             let client=reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
-            Some(McpRelay{secret,master,auth_url:url,client})
+            Some(McpRelay{secret,a_half_file,auth_url:url,client})
         }
-        _=>return Err("Set KH_DEBUG_MASTER_A, KH_DEBUG_AUTH_RELAY_URL and KH_DEBUG_SERVICE_TOKEN_FILE together".into())
+        _=>return Err("Set KH_DEBUG_A_HALF_FILE, KH_DEBUG_AUTH_RELAY_URL and KH_DEBUG_SERVICE_TOKEN_FILE together".into())
     };
     let state = Arc::new(AppState {
         images,
@@ -455,7 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/mcp", post(mcp))
-        .route("/internal/master-sha256", get(master_digest))
+        .route("/internal/a-half", get(master_digest))
         .layer(DefaultBodyLimit::max(14 * 1024 * 1024))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --uid 10004 --create-home khagent \
     && mkdir -p /agent /opt/kh-agent
 COPY --from=builder /build/target/release/kh-debug-agent /usr/local/bin/kh-debug-agent
-COPY assets/kernelhermit-default.png /agent/B.png
+COPY tests/fixtures/b-half.txt /agent/b-half.txt
 COPY tests/container-agent/diagnostic.sh /opt/kh-agent/diagnostic.sh
 USER khagent
 ENV KH_AGENT_AUTH_URL=http://auth:41371 KH_AGENT_USER=testagent KH_AGENT_B=/agent/B.png KH_AGENT_SHELL=sh

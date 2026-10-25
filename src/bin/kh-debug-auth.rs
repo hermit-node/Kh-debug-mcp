@@ -409,16 +409,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Pairing A image missing".into());
     }
     let relay = match (
-        env::var("KH_AUTH_MCP_MASTER_URL").ok(),
+        env::var("KH_AUTH_MCP_A_HALF_URL").ok(),
         env::var("KH_AUTH_MCP_TOKEN_FILE").ok(),
+        env::var("KH_AUTH_MASTER_SHA256_FILE").ok(),
     ) {
-        (None, None) => None,
-        (Some(url), Some(file)) => {
+        (None, None, None) => None,
+        (Some(url), Some(file), Some(master_file)) => {
+            let master_file=PathBuf::from(master_file);
+            if !master_file.is_absolute() || !master_file.is_file() {
+                return Err("AuthGate master file must be an existing absolute path".into())
+            }
+            let contents=std::fs::read_to_string(&master_file)?;
+            if contents.trim().len()!=64 || !contents.trim().bytes().all(|c|c.is_ascii_hexdigit()) {
+                return Err("AuthGate master must be 64 hexadecimal characters".into());
+            }
             if !url.starts_with("http://127.0.0.1:")
                 && !url.starts_with("http://localhost:")
                 && !url.starts_with("http://mcp:41370/")
             {
-                return Err("Master A checksum endpoint must be private".into());
+                return Err("MCP A-half endpoint must be private".into());
             }
             let token = std::fs::read_to_string(file)?.trim().to_owned();
             if token.len() < 32 {
@@ -431,9 +440,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !(5..=3600).contains(&seconds) {
                 return Err("Lease must be from 5 to 3600 seconds".into());
             }
-            Some(Arc::new(relay::Relay::new(token, url, seconds)?))
+            Some(Arc::new(relay::Relay::new(token, url, master_file, seconds)?))
         }
-        _ => return Err("Both KH_AUTH_MCP_MASTER_URL and KH_AUTH_MCP_TOKEN_FILE required".into()),
+        _ => return Err("Set KH_AUTH_MCP_A_HALF_URL, KH_AUTH_MCP_TOKEN_FILE and KH_AUTH_MASTER_SHA256_FILE together".into()),
     };
     let settings = Arc::new(Settings {
         api_token,

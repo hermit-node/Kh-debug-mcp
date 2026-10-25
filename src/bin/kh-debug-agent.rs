@@ -1,6 +1,5 @@
 //! User-side ephemeral diagnostic agent: holds only B and makes outbound HTTP.
 //! Runs only the configured PowerShell or /bin/sh mode after AuthGate approves a job.
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{env, process::Stdio, time::Duration};
 use tokio::{process::Command, time::timeout};
@@ -87,13 +86,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Development agent requires local AuthGate or a secure local forwarding endpoint; never use unprotected remote HTTP".into());
     }
     let user = env::var("KH_AGENT_USER")?;
-    let b = tokio::fs::read(env::var("KH_AGENT_B")?).await?;
+    let b = tokio::fs::read_to_string(env::var("KH_AGENT_B_HALF_FILE")?).await?;
+    let b = b.trim();
+    if b.len() != 32 || !b.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("User B half must be exactly 32 hex characters".into());
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()?;
     let response = client
         .post(format!("{endpoint}/agent/login"))
-        .json(&json!({"user_id":user,"b_png_base64":STANDARD.encode(b)}))
+        .json(&json!({"user_id":user,"b_half":b}))
         .send()
         .await?;
     if !response.status().is_success() {

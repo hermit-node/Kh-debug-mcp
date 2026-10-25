@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && chown -R 10002:10002 /auth /provision && chown 10002:10003 /service && chmod 2770 /service
 COPY --from=build /build/target/release/kh-debug-auth /usr/local/bin/kh-debug-auth
 COPY --from=build /build/target/release/kh-debug-pairgen /usr/local/bin/kh-debug-pairgen
+COPY tests/fixtures/master.sha256 /opt/kh-auth/test-master.sha256
 USER khauth
 ENV KH_AUTH_BIND=0.0.0.0:41371 KH_AUTH_STATE_DIR=/auth/state
 WORKDIR /home/khauth

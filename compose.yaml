@@ -1,7 +1,7 @@
 name: kh-debug-mcp
 # MCP and AuthGate run by default; optional disposable user-agent container for real shell tests.
 # The AuthGate is the ONLY path between MCP and the user diagnostic agent.
-# In this SHA-only test, both pictures must contain identical lossless PNG bytes.
+# Test-only full 64 hex master in Auth; 32 A hex in MCP; 32 B hex in user.
 services:
   auth:
     build:
@@ -20,7 +20,8 @@ services:
       KH_AUTH_STATE_DIR: "/auth/state"
       KH_AUTH_API_TOKEN_FILE: "/auth/state/auth_api_token"
       KH_AUTH_MCP_TOKEN_FILE: "/service/token"
-      KH_AUTH_MCP_MASTER_URL: "http://mcp:41370/internal/master-sha256"
+      KH_AUTH_MCP_A_HALF_URL: "http://mcp:41370/internal/a-half"
+      KH_AUTH_MASTER_SHA256_FILE: "/opt/kh-auth/test-master.sha256"
       KH_AUTH_LEASE_SECONDS: "${KH_AUTH_LEASE_SECONDS:-300}"
     volumes:
       - auth_state:/auth/state
@@ -56,7 +57,7 @@ services:
       KH_DEBUG_BIND: "0.0.0.0:41370"
       KH_DEBUG_ALLOWED_HOSTS: "localhost:41370,127.0.0.1:41370"
       KH_DEBUG_IMAGE_DIR: "/data/screenshots"
-      KH_DEBUG_MASTER_A: "/opt/kh-debug/master.png"
+      KH_DEBUG_A_HALF_FILE: "/opt/kh-debug/a-half.txt"
       KH_DEBUG_SERVICE_TOKEN_FILE: "/service/token"
       KH_DEBUG_AUTH_RELAY_URL: "http://auth:41371/relay/command"
     volumes:
@@ -91,7 +92,7 @@ services:
     environment:
       KH_AGENT_AUTH_URL: "http://auth:41371"
       KH_AGENT_USER: "testagent"
-      KH_AGENT_B: "/agent/B.png"
+      KH_AGENT_B_HALF_FILE: "/agent/b-half.txt"
       KH_AGENT_SHELL: "sh"
     read_only: true
     cap_drop: [ALL]

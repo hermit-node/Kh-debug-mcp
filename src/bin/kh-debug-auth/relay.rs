@@ -1,14 +1,14 @@
 //! AuthGate-only relay: MCP owns A, user-side agent submits B directly here.
 //! Temporary exact SHA-256 equality check, NOT real StegoSplit cryptography.
-use super::{Settings, acceptable_image, authorized};
+use super::{Settings, authorized};
+use std::path::PathBuf;
+use subtle::ConstantTimeEq;
 use axum::{
     Json,
     extract::State,
     http::{HeaderMap, StatusCode},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
@@ -22,9 +22,30 @@ use tokio::{
     time::timeout,
 };
 
+fn valid_halves(a:&str,b:&str,master:&str)->bool {
+    if a.len()!=32 || b.len()!=32 || master.len()!=64 ||
+        !a.bytes().chain(b.bytes()).chain(master.bytes()).all(|c| c.is_ascii_hexdigit()) {
+        return false
+    }
+    let assembled = format!("{}{}",a.to_ascii_lowercase(),b.to_ascii_lowercase());
+    bool::from(assembled.as_bytes().ct_eq(master.to_ascii_lowercase().as_bytes()))
+}
+#[cfg(test)]
+mod checksum_tests {
+    use super::*;
+    #[test]
+    fn matched_halves_only() {
+        let m="537b05c88c8780ce074e1cadab11089bed2966cc8adda8c7b66fa89e1aaaec3f";
+        assert!(valid_halves(&m[..32],&m[32..],m));
+        assert!(!valid_halves(&m[32..],&m[..32],m));
+        assert!(!valid_halves(&m[..32],"ffffffffffffffffffffffffffffffff",m));
+        assert!(!valid_halves(&m[..31],&m[32..],m));
+    }
+}
 pub struct Relay {
     service_token: String,
-    master_url: String,
+    a_half_url: String,
+    master_file: PathBuf,
     client: reqwest::Client,
     lease: Duration,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -33,7 +54,7 @@ pub struct Relay {
 }
 struct Session {
     user: String,
-    b_digest: String,
+    b_half: String,
     expires: Instant,
     sender: mpsc::Sender<Job>,
     receiver: Mutex<mpsc::Receiver<Job>>,
@@ -51,12 +72,14 @@ struct Pending {
 impl Relay {
     pub fn new(
         service_token: String,
-        master_url: String,
+        a_half_url: String,
+        master_file: PathBuf,
         lease_seconds: u64,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             service_token,
-            master_url,
+            a_half_url,
+            master_file,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()?,
@@ -66,30 +89,26 @@ impl Relay {
             next_id: AtomicU64::new(1),
         })
     }
-    async fn master_sha(&self) -> Option<String> {
-        let resp = self
-            .client
-            .get(&self.master_url)
-            .bearer_auth(&self.service_token)
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
+    async fn a_half(&self) -> Option<String> {
+        let resp = self.client.get(&self.a_half_url)
+            .bearer_auth(&self.service_token).send().await.ok()?;
+        if !resp.status().is_success() {return None}
         let body: Value = resp.json().await.ok()?;
-        let digest = body["sha256"].as_str()?;
-        if digest.len() != 64 || !digest.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return None;
-        }
-        Some(digest.to_ascii_lowercase())
+        let part = body["a_half"].as_str()?;
+        if part.len()!=32 || !part.bytes().all(|c| c.is_ascii_hexdigit()) {return None}
+        Some(part.to_ascii_lowercase())
+    }
+    async fn check_halves(&self, b_half: &str) -> bool {
+        let Some(a_half) = self.a_half().await else {return false};
+        let Ok(master) = tokio::fs::read_to_string(&self.master_file).await else {return false};
+        valid_halves(&a_half,b_half,master.trim())
     }
     async fn validate(&self, token: &str, session: &Session) -> bool {
         let valid = Instant::now() < session.expires
-            && self.master_sha().await.as_deref() == Some(session.b_digest.as_str());
+            && self.check_halves(&session.b_half).await;
         if !valid {
             self.sessions.lock().await.remove(token);
-            self.pending.lock().await.retain(|_, p| p.token != token);
+            self.pending.lock().await.retain(|_,p|p.token != token);
         }
         valid
     }
@@ -121,15 +140,8 @@ pub async fn login(
         return denied();
     };
     let user = body["user_id"].as_str().unwrap_or("");
-    let b = body["b_png_base64"].as_str().unwrap_or("");
-    if user.is_empty() || user.len() > 128 || !acceptable_image(b) {
-        return denied();
-    }
-    let Ok(image) = STANDARD.decode(b) else {
-        return denied();
-    };
-    let digest = format!("{:x}", Sha256::digest(image));
-    if relay.master_sha().await.as_deref() != Some(digest.as_str()) {
+    let b = body["b_half"].as_str().unwrap_or("");
+    if user.is_empty() || user.len() > 128 || !relay.check_halves(b).await {
         return denied();
     }
     let mut random = [0u8; 32];
@@ -152,7 +164,7 @@ pub async fn login(
         token.clone(),
         Arc::new(Session {
             user: user.into(),
-            b_digest: digest,
+            b_half: b.to_ascii_lowercase(),
             expires: Instant::now() + relay.lease,
             sender: tx,
             receiver: Mutex::new(rx),
