@@ -17,11 +17,18 @@ use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const PNG_HEADER: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
+struct PythonBridge {
+    python_exe: PathBuf,
+    script: PathBuf,
+    cover: PathBuf,
+}
+
 struct Settings {
     api_token: String,
     verifier: Option<PathBuf>,
     state_dir: PathBuf,
     pair_a: Option<PathBuf>,
+    python: Option<PythonBridge>,
 }
 
 fn authorized(headers: &HeaderMap, secret: &str) -> bool {
@@ -127,10 +134,132 @@ async fn verify(
     }
 }
 
+/// The Rust gate owns HTTP; the reference Python process owns StegoSplit operations.
+/// Both source A and supplied B are passed over a local child-process stdin pipe.
+async fn reference_call(settings: &Settings, request: Value) -> Result<Value, StatusCode> {
+    let Some(bridge) = &settings.python else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut child = Command::new(&bridge.python_exe);
+    child
+        .arg(&bridge.script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("KH_AUTH_STATE_DIR", &settings.state_dir)
+        .kill_on_drop(true);
+    let mut process = child.spawn().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let message = request.to_string();
+    let Some(mut input) = process.stdin.take() else {
+        return Err(StatusCode::BAD_GATEWAY);
+    };
+    if !matches!(
+        timeout(Duration::from_secs(30), input.write_all(message.as_bytes())).await,
+        Ok(Ok(()))
+    ) {
+        return Err(StatusCode::GATEWAY_TIMEOUT);
+    }
+    drop(input);
+    let output = timeout(Duration::from_secs(60), process.wait_with_output())
+        .await
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !output.status.success() || output.stdout.len() > 14 * 1024 * 1024 {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    serde_json::from_slice(&output.stdout).map_err(|_| StatusCode::BAD_GATEWAY)
+}
+
+async fn reference_admin(
+    State(settings): State<Arc<Settings>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    if !authorized(&headers, &settings.api_token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized"})),
+        );
+    }
+    let Some(bridge) = &settings.python else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"Python reference backend disabled"})),
+        );
+    };
+    let op = body
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    if !matches!(op.as_str(), "bootstrap" | "issue" | "revoke" | "list") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"unsupported operation"})),
+        );
+    }
+    let mut request = body;
+    if op == "bootstrap" {
+        let Ok(cover) = tokio::fs::read(&bridge.cover).await else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"configured source PNG unavailable"})),
+            );
+        };
+        if cover.len() > MAX_IMAGE_BYTES {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"source PNG too large"})),
+            );
+        }
+        request["cover_png_base64"] = json!(STANDARD.encode(cover));
+    }
+    match reference_call(&settings, request).await {
+        Ok(result) => (StatusCode::OK, Json(result)),
+        Err(status) => (status, Json(json!({"error":"reference operation failed"}))),
+    }
+}
+
 async fn verify_pair(
     State(settings): State<Arc<Settings>>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    if settings.python.is_some() {
+        // Server-held A and client-presented B are both handed to the original
+        // Python StegoSplit verifier. Credential registry, expiry, revocation
+        // and password handling remain entirely in the reference backend.
+        let image = body
+            .get("b_png_base64")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let user = body
+            .get("expected_user")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let password = body.get("password").and_then(Value::as_str).unwrap_or("");
+        if !acceptable_image(image) || user.is_empty() || password.is_empty() {
+            return (StatusCode::BAD_REQUEST, Json(json!({"authorized":false})));
+        }
+        let a = settings.state_dir.join("verifier").join("master.png");
+        let Ok(master) = tokio::fs::read(a).await else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"authorized":false})),
+            );
+        };
+        let request = json!({
+            "operation":"verify",
+            "a_png_base64": STANDARD.encode(master),
+            "b_png_base64": image,
+            "expected_user": user,
+            "password": password
+        });
+        return match reference_call(&settings, request).await {
+            Ok(result) if result["authorized"] == true => (StatusCode::OK, Json(result)),
+            Ok(_) => (StatusCode::UNAUTHORIZED, Json(json!({"authorized":false}))),
+            Err(status) => (status, Json(json!({"authorized":false}))),
+        };
+    }
     let Some(a) = settings.pair_a.as_ref().filter(|p| p.is_file()) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -172,6 +301,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if verifier.as_ref().is_some_and(|p| !p.is_absolute()) {
         return Err("Verifier path must be absolute".into());
     }
+    let python = match (
+        env::var("KH_AUTH_PYTHON").ok(),
+        env::var("KH_AUTH_BRIDGE_SCRIPT").ok(),
+        env::var("KH_AUTH_COVER_PNG").ok(),
+    ) {
+        (None, None, None) => None,
+        (Some(interpreter), Some(script), Some(cover)) => {
+            let paths = [
+                PathBuf::from(interpreter),
+                PathBuf::from(script),
+                PathBuf::from(cover),
+            ];
+            if paths.iter().any(|p| !p.is_absolute() || !p.is_file()) {
+                return Err("Python reference paths must be existing absolute files".into());
+            }
+            Some(PythonBridge {
+                python_exe: paths[0].clone(),
+                script: paths[1].clone(),
+                cover: paths[2].clone(),
+            })
+        }
+        _ => {
+            return Err(
+                "Set KH_AUTH_PYTHON, KH_AUTH_BRIDGE_SCRIPT and KH_AUTH_COVER_PNG together".into(),
+            );
+        }
+    };
     let pair_a = env::var("KH_AUTH_PAIR_A").ok().map(PathBuf::from);
     if pair_a.as_ref().is_some_and(|p| !p.is_file()) {
         return Err("Pairing A image missing".into());
@@ -181,12 +337,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_dir,
         verifier,
         pair_a,
+        python,
     });
     let bind = env::var("KH_AUTH_BIND").unwrap_or_else(|_| "127.0.0.1:41371".into());
     let app = Router::new()
         .route("/health", get(health))
         .route("/verify", post(verify))
         .route("/verify-pair", post(verify_pair))
+        .route("/reference/admin", post(reference_admin))
         .layer(DefaultBodyLimit::max(14 * 1024 * 1024))
         .with_state(settings);
     let listener = tokio::net::TcpListener::bind(&bind).await?;

@@ -11,3 +11,5 @@
 /secrets/
 /screenshots/
 /dist
+/oracle_reference_temp.py
+/dev/reference_http_smoke.ps1

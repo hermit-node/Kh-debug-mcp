@@ -26,6 +26,8 @@ struct AppState {
 struct PairGate {
     url: String,
     b_png_base64: String,
+    user: Option<String>,
+    password: Option<String>,
     client: reqwest::Client,
 }
 impl PairGate {
@@ -33,7 +35,7 @@ impl PairGate {
         let req = self
             .client
             .post(&self.url)
-            .json(&json!({"b_png_base64": self.b_png_base64}))
+            .json(&json!({"b_png_base64": self.b_png_base64,"expected_user":self.user,"password":self.password}))
             .send()
             .await;
         let Ok(reply) = req else {
@@ -270,9 +272,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()?;
+            let user = env::var("KH_DEBUG_PAIR_USER").ok();
+            let password = match env::var("KH_DEBUG_PAIR_PASSWORD_FILE") {
+                Ok(file) => Some(
+                    tokio::fs::read_to_string(file)
+                        .await?
+                        .trim_end_matches(['\r', '\n'])
+                        .to_owned(),
+                ),
+                Err(env::VarError::NotPresent) => None,
+                Err(_) => return Err("Invalid pairing password path".into()),
+            };
+            if user.is_some() != password.is_some() {
+                return Err("User and password file must both be set".into());
+            }
             Some(PairGate {
                 url,
                 b_png_base64: STANDARD.encode(png),
+                user,
+                password,
                 client,
             })
         }

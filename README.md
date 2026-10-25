@@ -59,6 +59,20 @@ The server supports MCP Streamable HTTP (`initialize`, `ping`, `tools/list`, `to
 
 When a trusted proxy forwards a different `Host` header, configure `KH_DEBUG_ALLOWED_HOSTS` as a comma-separated allowlist of the exact host-and-port values. Configure `KH_DEBUG_BIND` only when different in-container binding is necessary. Compose intentionally publishes to **host loopback only**.
 
+## Windows reference StegoSplit bridge (development only)
+
+Rust Auth Server can use the **original Windows Python 3.14 compiled StegoSplit**
+implementation through the local process adapter in `dev/stegosplit_reference_bridge.py`.
+Rust sends server-held A and presented B to Python over standard input; Python
+checks its registered credential database, passwords, expiry and revocation.
+The Rust MCP rechecks the result before PowerShell tool execution. Multiple B
+credentials can share one unchanged A. See [dev/README.md](dev/README.md).
+
+This is a development compatibility harness on Windows. **The Linux Docker images
+still use the earlier experimental 1-to-1 image gate. They do not package Python,
+`.pyd` modules or the new registered-user backend.** Do not describe the Docker
+stack as supporting original StegoSplit users until the Rust port is complete.
+
 ## Security and storage
 
 This is a basic MCP experiment, **not a hardened public service**. It has no application-level authentication. Allow access only from a trusted local interface and trusted tunnel; other containers sharing the same Docker network may also be able to reach it. It executes PowerShell with the permissions of its process. Do not use `privileged` mode or mount the host's Docker socket.
