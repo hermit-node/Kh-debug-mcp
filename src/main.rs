@@ -365,7 +365,10 @@ async fn master_digest(
     if part.len() != 32 || !part.bytes().all(|c| c.is_ascii_hexdigit()) {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
     }
-    (StatusCode::OK, Json(json!({"a_half":part.to_ascii_lowercase()})))
+    (
+        StatusCode::OK,
+        Json(json!({"a_half":part.to_ascii_lowercase()})),
+    )
 }
 
 async fn health() -> Json<Value> {

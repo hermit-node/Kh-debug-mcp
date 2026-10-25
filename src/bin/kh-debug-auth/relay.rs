@@ -1,14 +1,13 @@
 //! AuthGate-only relay: MCP owns A, user-side agent submits B directly here.
 //! Temporary exact SHA-256 equality check, NOT real StegoSplit cryptography.
 use super::{Settings, authorized};
-use std::path::PathBuf;
-use subtle::ConstantTimeEq;
 use axum::{
     Json,
     extract::State,
     http::{HeaderMap, StatusCode},
 };
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::{
     collections::HashMap,
     sync::{
@@ -17,29 +16,45 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use subtle::ConstantTimeEq;
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     time::timeout,
 };
 
-fn valid_halves(a:&str,b:&str,master:&str)->bool {
-    if a.len()!=32 || b.len()!=32 || master.len()!=64 ||
-        !a.bytes().chain(b.bytes()).chain(master.bytes()).all(|c| c.is_ascii_hexdigit()) {
-        return false
+fn valid_halves(a: &str, b: &str, master: &str) -> bool {
+    if a.len() != 32
+        || b.len() != 32
+        || master.len() != 64
+        || !a
+            .bytes()
+            .chain(b.bytes())
+            .chain(master.bytes())
+            .all(|c| c.is_ascii_hexdigit())
+    {
+        return false;
     }
-    let assembled = format!("{}{}",a.to_ascii_lowercase(),b.to_ascii_lowercase());
-    bool::from(assembled.as_bytes().ct_eq(master.to_ascii_lowercase().as_bytes()))
+    let assembled = format!("{}{}", a.to_ascii_lowercase(), b.to_ascii_lowercase());
+    bool::from(
+        assembled
+            .as_bytes()
+            .ct_eq(master.to_ascii_lowercase().as_bytes()),
+    )
 }
 #[cfg(test)]
 mod checksum_tests {
     use super::*;
     #[test]
     fn matched_halves_only() {
-        let m="537b05c88c8780ce074e1cadab11089bed2966cc8adda8c7b66fa89e1aaaec3f";
-        assert!(valid_halves(&m[..32],&m[32..],m));
-        assert!(!valid_halves(&m[32..],&m[..32],m));
-        assert!(!valid_halves(&m[..32],"ffffffffffffffffffffffffffffffff",m));
-        assert!(!valid_halves(&m[..31],&m[32..],m));
+        let m = "537b05c88c8780ce074e1cadab11089bed2966cc8adda8c7b66fa89e1aaaec3f";
+        assert!(valid_halves(&m[..32], &m[32..], m));
+        assert!(!valid_halves(&m[32..], &m[..32], m));
+        assert!(!valid_halves(
+            &m[..32],
+            "ffffffffffffffffffffffffffffffff",
+            m
+        ));
+        assert!(!valid_halves(&m[..31], &m[32..], m));
     }
 }
 pub struct Relay {
@@ -90,25 +105,37 @@ impl Relay {
         })
     }
     async fn a_half(&self) -> Option<String> {
-        let resp = self.client.get(&self.a_half_url)
-            .bearer_auth(&self.service_token).send().await.ok()?;
-        if !resp.status().is_success() {return None}
+        let resp = self
+            .client
+            .get(&self.a_half_url)
+            .bearer_auth(&self.service_token)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
         let body: Value = resp.json().await.ok()?;
         let part = body["a_half"].as_str()?;
-        if part.len()!=32 || !part.bytes().all(|c| c.is_ascii_hexdigit()) {return None}
+        if part.len() != 32 || !part.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
         Some(part.to_ascii_lowercase())
     }
     async fn check_halves(&self, b_half: &str) -> bool {
-        let Some(a_half) = self.a_half().await else {return false};
-        let Ok(master) = tokio::fs::read_to_string(&self.master_file).await else {return false};
-        valid_halves(&a_half,b_half,master.trim())
+        let Some(a_half) = self.a_half().await else {
+            return false;
+        };
+        let Ok(master) = tokio::fs::read_to_string(&self.master_file).await else {
+            return false;
+        };
+        valid_halves(&a_half, b_half, master.trim())
     }
     async fn validate(&self, token: &str, session: &Session) -> bool {
-        let valid = Instant::now() < session.expires
-            && self.check_halves(&session.b_half).await;
+        let valid = Instant::now() < session.expires && self.check_halves(&session.b_half).await;
         if !valid {
             self.sessions.lock().await.remove(token);
-            self.pending.lock().await.retain(|_,p|p.token != token);
+            self.pending.lock().await.retain(|_, p| p.token != token);
         }
         valid
     }
